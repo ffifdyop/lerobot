@@ -69,11 +69,16 @@ class DatasetRecordConfig:
     # ~1s buffer at 30fps. Provides backpressure if the encoder can't keep up.
     encoder_queue_maxsize: int = 30
     # Number of threads per encoder instance. None = auto (codec default).
-    # Lower values reduce CPU usage, maps to 'lp' (via svtav1-params) for libsvtav1 and 'threads' for h264/hevc..
+    # Lower values reduces CPU usage, maps to 'lp' (via svtav1-params) for libsvtav1 and 'threads' for h264/hevc..
     encoder_threads: int | None = None
     # Skip appending the date-time tag to repo_id, keeping the user-provided name as-is
     # (e.g. self-managed versioned names intended for a later `lerobot-edit-dataset merge`).
     no_stamp: bool = False
+    # Max size (in MB) per video shard. Episodes are concatenated into the same
+    # MP4 until adding another would exceed this size, then a new file is opened.
+    # A single episode larger than this still becomes its own (oversized) file.
+    # None falls back to DEFAULT_VIDEO_FILE_SIZE_IN_MB (200).
+    video_files_size_in_mb: int | None = None
 
     def stamp_repo_id(self) -> None:
         """Append a date-time tag to ``repo_id`` so each recording session gets a unique name.

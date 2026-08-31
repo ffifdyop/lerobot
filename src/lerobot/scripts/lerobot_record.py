@@ -475,6 +475,7 @@ def record(
                 encoder_threads=cfg.dataset.encoder_threads,
                 streaming_encoding=cfg.dataset.streaming_encoding,
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                video_files_size_in_mb=cfg.dataset.video_files_size_in_mb,
             )
 
         # Connect the teleoperator before the robot so the robot isn't left idle (and possibly

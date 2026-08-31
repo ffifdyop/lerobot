@@ -65,29 +65,26 @@ dependencies = [
     "opencv-python-headless>=4.9.0,<4.14.0",
     "Pillow>=10.0.0,<13.0.0",
     "einops>=0.8.0,<0.9.0",
-
     # Config & Hub
     "draccus>=0.11.6,<0.12.0",
     "huggingface-hub>=1.6.0,<2.0.0",
     "requests>=2.32.0,<3.0.0",
-
     # Environments
     # NOTE: gymnasium is used in lerobot.envs (lerobot-train, lerobot-eval), policies/factory,
     # and robots/unitree. Moving it to an optional extra would require import guards across many
     # tightly-coupled modules. Candidate for a future refactor to decouple envs from the core.
     "gymnasium>=1.1.1,<2.0.0",
-
     # Serialization & checkpointing
     "safetensors>=0.4.3,<1.0.0",
-
     # Lightweight utilities
     "packaging>=24.2,<26.0",
     "termcolor>=2.4.0,<4.0.0",
     "tqdm>=4.66.0,<5.0.0",
-
     # Build tools (required by opencv-python-headless on some platforms)
     "cmake>=3.29.0.1,<4.2.0",
     "setuptools>=71.0.0,<82.0.0",  # torch 2.11 requires setuptools<82; a higher cap makes the resolver downgrade torch
+    "socksio>=1.0.0",
+    "hf-transfer>=0.1.9",
 ]
 
 # Optional dependencies
@@ -312,8 +309,8 @@ all = [
     "lerobot[robstride]",
     "lerobot[gamepad]",
     "lerobot[hopejr]",
-    "lerobot[lekiwi]",
-    "lerobot[openarms]",
+    # "lerobot[lekiwi]",
+    # "lerobot[openarms]",
     "lerobot[reachy2]",
     "lerobot[rebot]",
     "lerobot[kinematics]",
@@ -335,11 +332,11 @@ all = [
     "lerobot[dev]",
     "lerobot[test]",
     "lerobot[video_benchmark]",
-    "lerobot[aloha]",
+    # "lerobot[aloha]",
     "lerobot[pusht]",
     "lerobot[phone]",
-    "lerobot[libero]; sys_platform == 'linux'",
-    "lerobot[metaworld]",
+    # "lerobot[libero]; sys_platform == 'linux'",
+    # "lerobot[metaworld]",
     "lerobot[sarm]",
     "lerobot[robometer]",
     "lerobot[topreward]",
@@ -367,6 +364,7 @@ lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-annotate="lerobot.scripts.lerobot_annotate:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
+lerobot-openpi-rollout="lerobot.scripts.lerobot_openpi_rollout:main"
 
 # ---------------- Tool Configurations ----------------
 
@@ -374,6 +372,21 @@ lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 # To use a different CUDA variant, reinstall torch with an explicit index, e.g.:
 #   uv pip install --force-reinstall torch torchvision \
 #       --index-url https://download.pytorch.org/whl/cu130
+# Default lerobot extras installed by `uv sync`.
+# Add more lerobot[<extra>] entries here as needed; skip with `uv sync --no-group extras`.
+[dependency-groups]
+extras = [
+    "lerobot[pi]",
+    "lerobot[smolvla]",
+    "lerobot[core_scripts]",
+    "lerobot[feetech]",
+    "lerobot[training]",
+    "lerobot[evaluation]",
+]
+
+[tool.uv]
+default-groups = ["extras"]
+
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
