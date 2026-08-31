@@ -1,0 +1,27 @@
+schema: spec-driven
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+context: |
+  Tech stack: Python, pytorch, lerobot
+  We use conventional commits
+  Domain: robotics, AI, and machine learning
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+rules:
+  proposal:
+    - Keep proposals under 500 words
+    - Use chinese
+    - Always include a "Non-goals" section
+  tasks:
+    - Break tasks into chunks of max 2 hours
+    - Use Chinese
+    - 需求视角清单，不要写得太细，也不要太空，
+  design:
+    - Use Chinese
+    - 要写“必须”和“禁止”
+  specs:
+    - Use Chinese
+    - 要求哦写成可验收场景

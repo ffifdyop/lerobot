@@ -176,3 +176,16 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# Datasets
+Datasets/
+
+# models
+models
+
+# openspec skills
+.claude/
+.codex/
+.kimi/
+.github/prompts/
+.github/skills/
