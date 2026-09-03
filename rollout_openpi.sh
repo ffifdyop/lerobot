@@ -64,6 +64,8 @@ lerobot-openpi-rollout \
   --robot.type=bi_so_follower \
   --robot.left_arm_config.port="$LEFT_FOLLOWER_PORT" \
   --robot.right_arm_config.port="$RIGHT_FOLLOWER_PORT" \
+  --robot.left_arm_config.use_degrees=false \
+  --robot.right_arm_config.use_degrees=false \
   --robot.id=bimanual_follower \
   --robot.left_arm_config.cameras="$LEFT_CAMERAS" \
   --robot.right_arm_config.cameras="$RIGHT_CAMERAS" \
