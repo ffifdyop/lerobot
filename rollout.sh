@@ -47,21 +47,28 @@ sudo chmod 666 "$LEFT_FOLLOWER_PORT" "$RIGHT_FOLLOWER_PORT" "$LEFT_LEADER_PORT" 
 
 
 LEFT_CAMERAS='{
-  wrist: {type: opencv, index_or_path: /dev/video0, width: 1280, height: 720, fps: 30,fourcc: "MJPG"},
-  top:   {type: opencv, index_or_path: /dev/video6, width: 1280, height: 720, fps: 30,fourcc: "MJPG"}
+  wrist: {type: opencv, index_or_path: /dev/video0, width: 1280, height: 720, fps: 30,fourcc: "MJPG"}
 }'
 
 RIGHT_CAMERAS='{
   wrist: {type: opencv, index_or_path: /dev/video8, width: 1280, height: 720, fps: 30,fourcc: "MJPG"}
 }'
 
-# Map robot camera names (left_top/left_wrist/right_wrist) to the names the
-# policy was trained on (camera1/camera2/camera3). Same map saved in the
-# checkpoint's policy_preprocessor.json, but rollout does not auto-load it.
-RENAME_MAP='{"observation.images.left_top":"observation.images.camera1","observation.images.left_wrist":"observation.images.camera2","observation.images.right_wrist":"observation.images.camera3"}'
-# RENAME_MAP='{"observation.images.left_top":"observation.images.base_0_rgb","observation.images.left_wrist":"observation.images.left_wrist_0_rgb","observation.images.right_wrist":"observation.images.right_wrist_0_rgb"}'
-POLICY_PATH=models/train/smolvla/smolvla-real_720p_ft_20260830_142257/checkpoints/last/pretrained_model
-# bPOLICY_PATH=models/train/pi05/pi05-real_ft_20260701_202015/checkpoints/040000/pretrained_model
+# 顶层相机：key 不加 left_/right_ 前缀，机器人观测键即为 top/left_wrist/right_wrist，
+# 与数据集（so101_bimanual_folding-cloth-720p）的键名完全一致
+TOP_CAMERAS='{
+  top: {type: opencv, index_or_path: /dev/video6, width: 1280, height: 720, fps: 30,fourcc: "MJPG"}
+}'
+
+# 与训练时 train_config.json 里的 rename_map 逐字一致：
+# 机器人/数据集的 top/left_wrist/right_wrist → policy 期望的 camera1/camera2/camera3。
+# 注意：必须显式传——CLI 的 map 会覆盖 checkpoint policy_preprocessor.json 里保存的
+# rename step（传空等于清空），不存在"自动加载 checkpoint 里的 map"。
+RENAME_MAP='{"observation.images.top":"observation.images.camera1","observation.images.left_wrist":"observation.images.camera2","observation.images.right_wrist":"observation.images.camera3"}'
+# RENAME_MAP='{"observation.images.top":"observation.images.base_0_rgb","observation.images.left_wrist":"observation.images.left_wrist_0_rgb","observation.images.right_wrist":"observation.images.right_wrist_0_rgb"}'
+POLICY_PATH=models/train/smolvla/smolvla-real_720p_ft_20260902_105132/checkpoints/080000/pretrained_model
+#POLICY_PATH=models/train/smolvla/smolvla-real_720p_ft_20260830_142257/checkpoints/last/pretrained_model
+# POLICY_PATH=models/train/pi05/pi05-real_ft_20260701_202015/checkpoints/040000/pretrained_model
 
 lerobot-rollout \
   --strategy.type=base \
@@ -74,7 +81,8 @@ lerobot-rollout \
   --robot.id=bimanual_follower \
   --robot.left_arm_config.cameras="$LEFT_CAMERAS" \
   --robot.right_arm_config.cameras="$RIGHT_CAMERAS" \
+  --robot.cameras="$TOP_CAMERAS" \
   --rename_map="$RENAME_MAP" \
   --task="fold the garment on the table" \
-  --duration=120
+  --duration=360
 

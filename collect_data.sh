@@ -56,15 +56,19 @@ RESUME=false
 
 # --- 相机配置 ---
 # 当前 setup: 3 个相机
-#   - left_wrist:  左臂 wrist 相机
-#   - right_wrist: 右臂 wrist 相机
-#   - top:         固定全局 top 相机（挂在左臂下）
+#   - left_wrist:  左臂 wrist 相机（left_arm_config.cameras 下的 wrist，自动加 left_ 前缀）
+#   - right_wrist: 右臂 wrist 相机（right_arm_config.cameras 下的 wrist，自动加 right_ 前缀）
+#   - top:         固定全局 top 相机（顶层 robot.cameras，key 不加前缀，原样保留）
 #
 # 支持两种相机类型:
 #   - opencv: 使用 index_or_path (整数，如 0, 1, 2...)
 #   - intelrealsense: 使用 serial_number_or_name
 #
-# 注意：左右臂的相机名称不要重复，否则后加载的会覆盖先加载的
+# 命名规则（BiSOFollower 硬编码）：
+#   - left_arm_config.cameras  下的 key → 观测键 left_<key>
+#   - right_arm_config.cameras 下的 key → 观测键 right_<key>
+#   - 顶层 robot.cameras        下的 key → 观测键保持原样（不加任何前缀）
+#   - 顶层 key 不能与左右臂的 key 重名，否则启动时报 ValueError
 #
 # 已绑定固定路径（udev规则），插拔后不变
 # 应用规则: sudo cp 99-so101-cameras.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules
@@ -76,21 +80,28 @@ RESUME=false
 # 故默认降到 720p。如需 1080p，把下面的 width/height 改回 1920/1080（建议同时
 # 把 FPS 降到 15）。
 LEFT_CAMERAS='{
-  wrist: {type: opencv, index_or_path: /dev/video6, width: 1280, height: 720, fps: 30, fourcc: "MJPG", backend: 200},
-  top:   {type: opencv, index_or_path: /dev/video4, width: 1280, height: 720, fps: 30, fourcc: "MJPG", backend: 200}
+  wrist: {type: opencv, index_or_path: /dev/video6, width: 1280, height: 720, fps: 30, fourcc: "MJPG", backend: 200}
 }'
 
 RIGHT_CAMERAS='{
   wrist: {type: opencv, index_or_path: /dev/video8, width: 1280, height: 720, fps: 30, fourcc: "MJPG", backend: 200}
 }'
 
+# 顶层相机（不归属于某条臂，key 不加前缀）。实际由左臂的 USB 设备打开，
+# 但观测/数据集里键名就是 top → observation.images.top
+TOP_CAMERAS='{
+  top: {type: opencv, index_or_path: /dev/video4, width: 1280, height: 720, fps: 30, fourcc: "MJPG", backend: 200}
+}'
+
 # 示例配置（RealSense摄像头，取消下方注释使用）:
 # LEFT_CAMERAS='{
-#   left_wrist: {type: intelrealsense, serial_number_or_name: "123456789012", width: 640, height: 480, fps: 30},
-#   top:        {type: intelrealsense, serial_number_or_name: "111111111111", width: 640, height: 480, fps: 30}
+#   left_wrist: {type: intelrealsense, serial_number_or_name: "123456789012", width: 640, height: 480, fps: 30}
 # }'
 # RIGHT_CAMERAS='{
 #   right_wrist: {type: intelrealsense, serial_number_or_name: "098765432109", width: 640, height: 480, fps: 30}
+# }'
+# TOP_CAMERAS='{
+#   top: {type: intelrealsense, serial_number_or_name: "111111111111", width: 640, height: 480, fps: 30}
 # }'
 
 # ==================== 辅助函数 ====================
@@ -176,6 +187,7 @@ lerobot-record \
     --robot.id=bimanual_follower \
     --robot.left_arm_config.cameras="$LEFT_CAMERAS" \
     --robot.right_arm_config.cameras="$RIGHT_CAMERAS" \
+    --robot.cameras="$TOP_CAMERAS" \
     --teleop.type=bi_so_leader \
     --teleop.left_arm_config.port="$LEFT_LEADER_PORT" \
     --teleop.right_arm_config.port="$RIGHT_LEADER_PORT" \
