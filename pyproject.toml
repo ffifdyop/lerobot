@@ -85,6 +85,8 @@ dependencies = [
     "setuptools>=71.0.0,<82.0.0",  # torch 2.11 requires setuptools<82; a higher cap makes the resolver downgrade torch
     "socksio>=1.0.0",
     "hf-transfer>=0.1.9",
+    # Local openpi client for `lerobot-openpi-rollout` (lazily imported at runtime)
+    "openpi-client",
 ]
 
 # Optional dependencies
@@ -386,6 +388,8 @@ extras = [
 
 [tool.uv]
 default-groups = ["extras"]
+# openpi-client pins numpy<2 but runs fine with numpy 2.x; force the project's range
+override-dependencies = ["numpy>=2.0.0,<2.3.0"]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
@@ -395,6 +399,7 @@ explicit = true
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
 torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+openpi-client = { path = "/home/gsp/Dev/Manipulation/openpi/packages/openpi-client", editable = true }
 
 [tool.setuptools.package-data]
 lerobot = ["envs/*.json", "annotations/steerable_pipeline/prompts/*.txt"]
