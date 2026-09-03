@@ -184,6 +184,8 @@ lerobot-record \
     --robot.type=bi_so_follower \
     --robot.left_arm_config.port="$LEFT_FOLLOWER_PORT" \
     --robot.right_arm_config.port="$RIGHT_FOLLOWER_PORT" \
+    --robot.left_arm_config.use_degrees=false \
+    --robot.right_arm_config.use_degrees=false \
     --robot.id=bimanual_follower \
     --robot.left_arm_config.cameras="$LEFT_CAMERAS" \
     --robot.right_arm_config.cameras="$RIGHT_CAMERAS" \
@@ -191,6 +193,8 @@ lerobot-record \
     --teleop.type=bi_so_leader \
     --teleop.left_arm_config.port="$LEFT_LEADER_PORT" \
     --teleop.right_arm_config.port="$RIGHT_LEADER_PORT" \
+    --teleop.left_arm_config.use_degrees=false \
+    --teleop.right_arm_config.use_degrees=false \
     --teleop.id=bimanual_leader \
     --dataset.repo_id="$DATASET_REPO_ID" \
     --dataset.single_task="$TASK_DESC" \

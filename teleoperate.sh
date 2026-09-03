@@ -43,8 +43,12 @@ lerobot-teleoperate \
     --robot.type=bi_so_follower \
     --robot.left_arm_config.port=/dev/ttyACM2 \
     --robot.right_arm_config.port=/dev/ttyACM3 \
+    --robot.left_arm_config.use_degrees=false \
+    --robot.right_arm_config.use_degrees=false \
     --robot.id=bimanual_follower \
     --teleop.type=bi_so_leader \
     --teleop.left_arm_config.port=/dev/ttyACM0 \
     --teleop.right_arm_config.port=/dev/ttyACM1 \
+    --teleop.left_arm_config.use_degrees=false \
+    --teleop.right_arm_config.use_degrees=false \
     --teleop.id=bimanual_leader
