@@ -181,7 +181,7 @@ outputs/
 Datasets/
 
 # models
-models
+models/lehome
 
 # openspec skills
 .claude/
