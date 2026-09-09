@@ -1,0 +1,29 @@
+{
+  "type": "dm05",
+  "host": "127.0.0.1",
+  "port": 7891,
+  "timeout": 10.0,
+  "execution_horizon": 25,
+  "use_history": true,
+  "history_max_frames": 5,
+  "output_action_dim": 12,
+  "camera_keys": {
+    "1": "observation.images.top",
+    "2": "observation.images.left_wrist",
+    "3": "observation.images.right_wrist"
+  },
+  "action_feature_names": [
+    "left_shoulder_pan.pos",
+    "left_shoulder_lift.pos",
+    "left_elbow_flex.pos",
+    "left_wrist_flex.pos",
+    "left_wrist_roll.pos",
+    "left_gripper.pos",
+    "right_shoulder_pan.pos",
+    "right_shoulder_lift.pos",
+    "right_elbow_flex.pos",
+    "right_wrist_flex.pos",
+    "right_wrist_roll.pos",
+    "right_gripper.pos"
+  ]
+}

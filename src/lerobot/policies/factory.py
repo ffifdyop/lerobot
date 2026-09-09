@@ -46,6 +46,7 @@ from lerobot.utils.constants import (
 from lerobot.utils.feature_utils import dataset_to_policy_features
 from lerobot.utils.import_utils import _peft_available, require_package
 
+from .dm05.configuration_dm05 import DM05Config
 from .evo1.configuration_evo1 import Evo1Config
 from .groot.configuration_groot import GrootConfig
 from .molmoact2.configuration_molmoact2 import MolmoAct2Config
@@ -207,6 +208,25 @@ def make_pre_post_processors(
                 config=policy_cfg,
                 pretrained_path=pretrained_path,
                 revision=pretrained_revision,
+                preprocessor_overrides=kwargs.get("preprocessor_overrides"),
+                postprocessor_overrides=kwargs.get("postprocessor_overrides"),
+                preprocessor_config_filename=kwargs.get(
+                    "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
+                ),
+                postprocessor_config_filename=kwargs.get(
+                    "postprocessor_config_filename", f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
+                ),
+            )
+
+        if isinstance(policy_cfg, DM05Config):
+            from .dm05.processor_dm05 import make_dm05_pre_post_processors_from_pretrained
+
+            return make_dm05_pre_post_processors_from_pretrained(
+                config=policy_cfg,
+                pretrained_path=pretrained_path,
+                revision=pretrained_revision,
+                dataset_stats=kwargs.get("dataset_stats"),
+                dataset_meta=kwargs.get("dataset_meta"),
                 preprocessor_overrides=kwargs.get("preprocessor_overrides"),
                 postprocessor_overrides=kwargs.get("postprocessor_overrides"),
                 preprocessor_config_filename=kwargs.get(
