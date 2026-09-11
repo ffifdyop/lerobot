@@ -30,6 +30,7 @@ from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
 
 from .inference import InferenceEngineConfig, SyncInferenceConfig
+from .saliency.config import SaliencyConfig, validate_saliency
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +275,8 @@ class RolloutConfig:
     display_port: int | None = None
     # Whether to display compressed (JPEG) images instead of raw frames
     display_compressed_images: bool = False
+    # Saliency overlay videos (--saliency.*). See rollout/saliency/config.py.
+    saliency: SaliencyConfig = field(default_factory=SaliencyConfig)
     # Use vocal synthesis to read events
     play_sounds: bool = True
     resume: bool = False
@@ -335,6 +338,10 @@ class RolloutConfig:
 
         if self.autosteer_interval_s < 0:
             raise ValueError(f"--autosteer_interval_s must be >= 0 (got {self.autosteer_interval_s}).")
+
+        validate_saliency(
+            self.saliency, self.inference, self.display_mode, self.display_data, self.use_torch_compile
+        )
 
         # Sentry MUST use streaming encoding to avoid disk I/O blocking the control loop
         if (

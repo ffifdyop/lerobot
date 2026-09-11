@@ -309,3 +309,46 @@ def test_log_rerun_data_blueprint_sent_only_once(mock_rerun):
     # Still only one blueprint, and the cached one is unchanged.
     assert len(blueprints) == 1
     assert rv.log_rerun_data.blueprint is first_blueprint
+
+
+def test_log_rerun_saliency_logs_entities(mock_rerun):
+    """Saliency frames are logged under ``saliency/<cam>`` and registered as known paths."""
+    rv, calls, _blueprints = mock_rerun
+
+    frame = np.full((6, 8, 3), 128, dtype=np.uint8)
+    rv.log_rerun_saliency({"cam1": frame})
+
+    img = _obj_for(calls, "saliency/cam1")
+    assert type(img).__name__ == "DummyImage"
+    assert img.arr is frame  # logged as-is, no transposition
+    assert _kwargs_for(calls, "saliency/cam1").get("static", False) is True
+    assert "cam1" in rv._SALIENCY_PATHS
+
+
+def test_log_rerun_saliency_resends_blueprint_only_for_new_paths(mock_rerun):
+    """A blueprint re-send happens exactly when a previously-unseen camera path arrives."""
+    rv, calls, blueprints = mock_rerun
+
+    # Simulate the observation blueprint having been sent before the first saliency frame.
+    rv.log_rerun_data(observation={"temp": 1.0}, action={"a": 2.0})
+    assert len(blueprints) == 1
+    calls.clear()
+
+    frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    rv.log_rerun_saliency({"cam1": frame})  # new path → rebuild + re-send
+    assert len(blueprints) == 2
+    assert {v.origin for v in _views_by_kind(blueprints[1], "Spatial2DView")} == {"saliency/cam1"}
+    # The rebuilt blueprint still carries the stashed observation/action views.
+    ts_views = {v.name: v for v in _views_by_kind(blueprints[1], "TimeSeriesView")}
+    assert ts_views["observation"].contents == ["observation.temp"]
+    assert ts_views["action"].contents == ["action.a"]
+
+    calls.clear()
+    rv.log_rerun_saliency({"cam1": frame})  # same path → no re-send
+    assert len(blueprints) == 2
+
+    calls.clear()
+    rv.log_rerun_saliency({"cam2": frame})  # another new path → one more re-send
+    assert len(blueprints) == 3
+    spatial_origins = {v.origin for v in _views_by_kind(blueprints[2], "Spatial2DView")}
+    assert spatial_origins == {"saliency/cam1", "saliency/cam2"}

@@ -2,6 +2,7 @@ source .venv/bin/activate
 
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
+export CUDA_VISIBLE_DEVICES=2
 
 # 左从臂串口
 LEFT_FOLLOWER_PORT="/dev/ttyACM2"
@@ -87,4 +88,11 @@ lerobot-rollout \
   --rename_map="$RENAME_MAP" \
   --task="fold the garment on the table" \
   --duration=360
+
+  # --- 可选：saliency 叠加热力图视频（每相机一个 mp4 + rerun 实时叠加画面） ---
+  # 启用前提：① 第 5 行 CUDA_VISIBLE_DEVICES 需改成多卡掩码（如 "2,3"），否则
+  #   进程内只见一张卡，explainer 副本将与策略共卡；② 取消下面两行注释。
+  # 产物目录：outputs/saliency/<时间戳>/{camera1,camera2,camera3}.mp4
+  # --saliency.enabled=true \
+  # --display_data=true --display_mode=rerun \
 

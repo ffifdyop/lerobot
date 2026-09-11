@@ -1368,6 +1368,151 @@ def test_rtc_engine_reset_discards_chunk_from_inflight_inference(caplog):
         assert _wait_for(lambda: engine.get_action(None) is not None)
 
 
+class _RecordingSink:
+    """Fake SaliencyManager: records submit events in call order."""
+
+    def __init__(self, events: list):
+        self.events = events
+        self.snapshots: list[dict] = []
+
+    def submit(self, snapshot) -> None:
+        self.events.append(("submit", snapshot))
+        self.snapshots.append(snapshot)
+
+
+def test_rtc_engine_saliency_sink_noise_injection_and_snapshot_order():
+    """With a sink attached the engine samples the flow-matching noise itself, snapshots
+    the replay inputs BEFORE calling the policy, and passes that noise to the policy."""
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.rollout.inference import RTCInferenceEngine
+
+    events: list[tuple] = []
+
+    class _NoiseAwareStub(_StubChunkPolicy):
+        def __init__(self, chunk_len: int, action_dim: int):
+            super().__init__(chunk_len=chunk_len, action_dim=action_dim)
+            self.config = SimpleNamespace(chunk_size=chunk_len, max_action_dim=action_dim)
+            self.received_noise: list = []
+            self.received_batches: list[dict] = []
+            self._events = events
+
+        def predict_action_chunk(self, batch, noise=None, inference_delay=0, prev_chunk_left_over=None):
+            self._events.append(("call", noise))
+            self.received_noise.append(noise)
+            self.received_batches.append(batch)
+            return super().predict_action_chunk(
+                batch, inference_delay=inference_delay, prev_chunk_left_over=prev_chunk_left_over
+            )
+
+    policy = _NoiseAwareStub(chunk_len=10, action_dim=2)
+    engine = RTCInferenceEngine(
+        policy=policy,
+        preprocessor=_IdentityPipeline(),
+        postprocessor=_IdentityPipeline(),
+        robot_wrapper=SimpleNamespace(robot_type="mock", action_features={}),
+        rtc_config=RTCConfig(enabled=True, execution_horizon=8, max_guidance_weight=1.0),
+        hw_features={
+            "observation.state": {"dtype": "float32", "shape": (2,), "names": ["j1.pos", "j2.pos"]},
+        },
+        task="task A",
+        fps=30.0,
+        device="cpu",
+    )
+    sink = _RecordingSink(events)
+    engine.saliency_sink = sink  # must land before the thread starts
+
+    engine.start()
+    try:
+        engine.resume()
+        engine.notify_observation(dict(_RTC_OBS))
+        policy.allow_one_inference()
+        assert _wait_for(lambda: len(policy.received_noise) >= 1)
+    finally:
+        policy.unblock()
+        engine.stop()
+
+    assert events, "no saliency events recorded"
+    noise = policy.received_noise[0]
+    snapshot = sink.snapshots[0]
+
+    # (a) the policy got the injected noise (not the internal sampling path)
+    assert noise is not None
+    assert torch.equal(noise, snapshot["noise"])
+
+    # (b) the snapshot was submitted before the policy was called
+    first_submit = events.index(next(e for e in events if e[0] == "submit"))
+    first_call = events.index(next(e for e in events if e[0] == "call"))
+    assert first_submit < first_call
+
+    # (c) the snapshot carries deep-copied tensors, not views of the batch
+    assert set(snapshot) == {"preprocessed", "noise", "chunk_kwargs"}
+    batch = policy.received_batches[0]
+    state = batch["observation.state"]
+    snap_state = snapshot["preprocessed"]["observation.state"]
+    assert snap_state is not state
+    assert torch.equal(snap_state, state)
+    assert snapshot["preprocessed"]["task"] is batch["task"]  # non-tensors by reference
+
+    # (d) noise shape/dtype/device match the flow-matching contract
+    assert noise.shape == (1, policy.config.chunk_size, policy.config.max_action_dim)
+    assert noise.dtype == torch.float32
+    assert noise.device == torch.device("cpu")
+
+
+def test_rtc_engine_sink_failure_disables_saliency(caplog):
+    """A raising sink must not kill the RTC thread: the engine degrades to the
+    disabled path (no noise injected) and keeps producing chunks."""
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.rollout.inference import RTCInferenceEngine
+
+    class _ExplodingSink:
+        def submit(self, snapshot) -> None:
+            raise RuntimeError("boom")
+
+    class _NoiseAwareStub(_StubChunkPolicy):
+        def __init__(self, chunk_len: int, action_dim: int):
+            super().__init__(chunk_len=chunk_len, action_dim=action_dim)
+            self.config = SimpleNamespace(chunk_size=chunk_len, max_action_dim=action_dim)
+            self.received_noise: list = []
+
+        def predict_action_chunk(self, batch, noise=None, inference_delay=0, prev_chunk_left_over=None):
+            self.received_noise.append(noise)
+            return super().predict_action_chunk(
+                batch, inference_delay=inference_delay, prev_chunk_left_over=prev_chunk_left_over
+            )
+
+    policy = _NoiseAwareStub(chunk_len=10, action_dim=2)
+    engine = RTCInferenceEngine(
+        policy=policy,
+        preprocessor=_IdentityPipeline(),
+        postprocessor=_IdentityPipeline(),
+        robot_wrapper=SimpleNamespace(robot_type="mock", action_features={}),
+        rtc_config=RTCConfig(enabled=True, execution_horizon=8, max_guidance_weight=1.0),
+        hw_features={
+            "observation.state": {"dtype": "float32", "shape": (2,), "names": ["j1.pos", "j2.pos"]},
+        },
+        task="task A",
+        fps=30.0,
+        device="cpu",
+    )
+    engine.saliency_sink = _ExplodingSink()
+
+    engine.start()
+    try:
+        engine.resume()
+        engine.notify_observation(dict(_RTC_OBS))
+        policy.allow_one_inference()
+        assert _wait_for(lambda: len(policy.received_noise) >= 1)
+        # degraded: the policy sampled internally (no injected noise) and the sink is off
+        assert policy.received_noise[0] is None
+        assert engine.saliency_sink is None
+        with caplog.at_level(logging.WARNING, logger="lerobot.rollout.inference.rtc"):
+            assert _wait_for(lambda: any("disabling saliency" in r.getMessage() for r in caplog.records))
+    finally:
+        policy.unblock()
+        engine.stop()
+
+
 def test_rtc_engine_answers_vqa_on_rtc_thread_delivered_by_control_pump():
     """The RTC thread generates the answer; only the control thread's pump delivers it."""
     # rtc_queue_threshold=-1 parks the chunk path, so the loop's only work is the query.

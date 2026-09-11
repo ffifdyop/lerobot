@@ -32,6 +32,7 @@ from typing import Any
 
 import torch
 
+from lerobot.policies.common.flow_matching import sample_noise
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc import ActionQueue, LatencyTracker, reanchor_relative_rtc_prefix
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
@@ -84,6 +85,25 @@ def supports_rtc_inference(policy: PreTrainedPolicy) -> bool:
             object(),
             inference_delay=0,
             prev_chunk_left_over=None,
+        )
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def accepts_noise_injection(policy: PreTrainedPolicy) -> bool:
+    """Whether ``predict_action_chunk`` also accepts the ``noise`` kwarg saliency replay injects.
+
+    Probed separately from :func:`supports_rtc_inference` because saliency is opt-in: a policy
+    can be RTC-capable without a noise parameter, and attaching a saliency sink to such a
+    policy must fail at build time instead of deep inside the RTC loop.
+    """
+    try:
+        inspect.signature(policy.predict_action_chunk).bind(
+            object(),
+            inference_delay=0,
+            prev_chunk_left_over=None,
+            noise=None,
         )
     except (TypeError, ValueError):
         return False
@@ -165,6 +185,27 @@ def _clamp_trained_rtc_delay(*, conditioned_delay: int, available_steps: int, tr
     return clamped
 
 
+def _build_saliency_snapshot(
+    preprocessed: dict,
+    noise: torch.Tensor | None,
+    inference_delay: int,
+    prev_chunk_left_over: torch.Tensor | None,
+) -> dict:
+    """Copy of everything the saliency explainer needs to replay one chunk exactly."""
+    return {
+        "preprocessed": {
+            k: (v.detach().clone() if isinstance(v, torch.Tensor) else v) for k, v in preprocessed.items()
+        },
+        "noise": None if noise is None else noise.detach().clone(),
+        "chunk_kwargs": {
+            "inference_delay": inference_delay,
+            "prev_chunk_left_over": None
+            if prev_chunk_left_over is None
+            else prev_chunk_left_over.detach().clone(),
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # RTCInferenceEngine
 # ---------------------------------------------------------------------------
@@ -221,6 +262,13 @@ class RTCInferenceEngine(InferenceEngine):
         self._failure_traceback: str | None = None
         self._global_shutdown_event = shutdown_event
         self._rtc_thread: Thread | None = None
+
+        # Optional saliency sink (SaliencyManager). When set, chunks are generated with an
+        # injected noise tensor (sampled here) and every produced chunk is snapshotted to
+        # the sink before the discard guards run — a snapshot may be replayed even if its
+        # chunk is later discarded. The explainer replays it with the exact same noise for
+        # exact gradients.
+        self.saliency_sink = None
 
         if not self._use_torch_compile:
             self._compile_warmup_done.set()
@@ -500,8 +548,46 @@ class RTCInferenceEngine(InferenceEngine):
                                 prev_actions, target_steps=self._rtc_config.execution_horizon
                             )
 
+                        noise = None
+                        if self.saliency_sink is not None:
+                            # Snapshot BEFORE the call: `_prepare_batch` → `_pi_aloha_decode_state`
+                            # mutates `batch[OBS_STATE]` in place, so a post-call snapshot would
+                            # capture already-decoded state and the explainer's replay would diverge.
+                            try:
+                                noise = sample_noise(
+                                    (
+                                        1,
+                                        int(self._policy.config.chunk_size),
+                                        int(self._policy.config.max_action_dim),
+                                    ),
+                                    policy_device,
+                                )
+                                if self._compile_warmup_done.is_set():
+                                    self.saliency_sink.submit(
+                                        _build_saliency_snapshot(
+                                            preprocessed,
+                                            noise=noise,
+                                            inference_delay=delay,
+                                            prev_chunk_left_over=prev_actions,
+                                        )
+                                    )
+                            except Exception:
+                                # A broken sidecar must never take the live rollout down: degrade
+                                # to the disabled path (no noise injection, no snapshots).
+                                logger.warning(
+                                    "Saliency sink failed; disabling saliency for this session", exc_info=True
+                                )
+                                self.saliency_sink = None
+                                noise = None
+
+                        # Only pass ``noise`` when one was actually injected: policies whose
+                        # ``predict_action_chunk`` has no noise parameter (the probe only checks
+                        # ``inference_delay``/``prev_chunk_left_over``) must keep today's exact call.
                         actions = self._policy.predict_action_chunk(
-                            preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
+                            preprocessed,
+                            **({"noise": noise} if noise is not None else {}),
+                            inference_delay=delay,
+                            prev_chunk_left_over=prev_actions,
                         )
 
                         original = actions.squeeze(0).clone()
