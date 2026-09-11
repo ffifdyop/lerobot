@@ -270,6 +270,9 @@ def rollout(cfg: RolloutConfig):
         logger.info("Interrupted by user")
     finally:
         strategy.teardown(ctx)
+        if ctx.policy.saliency is not None:
+            logger.info("Finalizing saliency overlay videos...")
+            ctx.policy.saliency.stop()
         if cfg.display_data:
             shutdown_visualization(cfg.display_mode)
 

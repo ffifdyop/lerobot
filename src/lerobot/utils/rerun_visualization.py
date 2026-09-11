@@ -63,6 +63,7 @@ def init_rerun(
     log_rerun_data.blueprint = None  # type: ignore[attr-defined]
     log_rerun_data.blueprint_paths = None  # type: ignore[attr-defined]
     _IMAGE_SIZES.clear()
+    _SALIENCY_PATHS.clear()  # saliency paths belong to the old session too
 
     batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "8000")
     os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
@@ -99,6 +100,12 @@ def _build_blueprint(
     import rerun.blueprint as rrb
 
     views = [rrb.Spatial2DView(origin=path, name=path) for path in sorted(image_paths)]
+    # Snapshot the paths: the recorder thread may add cameras while the control
+    # thread builds a layout for newly available observations or predictions.
+    views.extend(
+        rrb.Spatial2DView(origin=f"saliency/{cam}", name=f"saliency/{cam}")
+        for cam in sorted(_SALIENCY_PATHS.copy())
+    )
 
     if observation_paths:
         views.append(rrb.TimeSeriesView(name="observation", contents=sorted(observation_paths)))
@@ -107,6 +114,11 @@ def _build_blueprint(
     views += [rrb.TextDocumentView(origin=path, name=path) for path in sorted(text_paths)]
 
     return rrb.Blueprint(rrb.Grid(*views))
+
+
+# Saliency overlay entity paths seen so far; the blueprint is rebuilt whenever
+# a new camera arrives, while retaining all observation and prediction panels.
+_SALIENCY_PATHS: set[str] = set()
 
 
 def _ensure_blueprint(
@@ -294,3 +306,24 @@ def log_rerun_data(
         _log_prediction(rr, prediction, observation_paths, image_paths, text_paths, compress_images)
 
     _ensure_blueprint(observation_paths, action_paths, image_paths, text_paths)
+
+
+def log_rerun_saliency(saliency_frames: dict[str, np.ndarray]) -> None:
+    """Log saliency overlay frames (RGB uint8) under ``saliency/<camera>`` entities."""
+    require_package("rerun-sdk", extra="viz", import_name="rerun")
+    import rerun as rr
+
+    for cam, frame in saliency_frames.items():
+        rr.log(f"saliency/{cam}", rr.Image(frame), static=True)
+
+    new_paths = set(saliency_frames) - _SALIENCY_PATHS
+    _SALIENCY_PATHS.update(saliency_frames)
+    if new_paths and getattr(log_rerun_data, "blueprint", None) is not None:
+        # The observation blueprint already ran (before the first saliency frame landed);
+        # rebuild it from the stashed path sets so the new overlay views are included.
+        paths = getattr(log_rerun_data, "blueprint_paths", None)
+        if paths is None:
+            paths = (set(), set(), set(), set())
+        blueprint = _build_blueprint(*paths)
+        log_rerun_data.blueprint = blueprint  # type: ignore[attr-defined]
+        rr.send_blueprint(blueprint)
