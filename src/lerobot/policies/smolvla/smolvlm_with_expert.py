@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -139,6 +140,14 @@ class SmolVLMWithExpertModel(nn.Module):
 
         self.num_attention_heads = self.config.text_config.num_attention_heads
         self.num_key_value_heads = self.config.text_config.num_key_value_heads
+
+        # Optional per-instance attention tap, signature `fn(layer_idx, probs, kind)` where
+        # `probs` is the float32 softmax output (before the cast back to the value dtype) of
+        # shape (B, heads, Lq, Lk) and `kind` is "self" or "cross". None means zero overhead
+        # (a single `is None` check per attention call). Per-instance on purpose: a saliency
+        # explainer sets it only on its own model copy, so the control-loop model can never
+        # fire it. See lerobot.rollout.saliency.
+        self.attention_capture: Callable[[int, torch.Tensor, str], None] | None = None
 
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
@@ -283,7 +292,14 @@ class SmolVLMWithExpertModel(nn.Module):
         attention_interface = self.get_attention_interface()
 
         att_output = attention_interface(
-            attention_mask_, batch_size, head_dim, query_states, key_states, value_states
+            attention_mask_,
+            batch_size,
+            head_dim,
+            query_states,
+            key_states,
+            value_states,
+            layer_idx=layer_idx,
+            kind="self",
         )
         return [att_output], past_key_values
 
@@ -329,7 +345,14 @@ class SmolVLMWithExpertModel(nn.Module):
             key_states = apply_rope(key_state, position_id)
 
             att_output = attention_interface(
-                prefix_attention_mask, batch_size, head_dim, query_states, key_states, value_states
+                prefix_attention_mask,
+                batch_size,
+                head_dim,
+                query_states,
+                key_states,
+                value_states,
+                layer_idx=layer_idx,
+                kind="self",
             )
             att_outputs.append(att_output)
         else:
@@ -385,6 +408,8 @@ class SmolVLMWithExpertModel(nn.Module):
                 expert_query_states,
                 expert_key_states,
                 expert_value_states,
+                layer_idx=layer_idx,
+                kind="cross",
             )
             att_outputs.append(att_output)
         else:
@@ -513,7 +538,15 @@ class SmolVLMWithExpertModel(nn.Module):
         return attention_interface
 
     def eager_attention_forward(
-        self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
+        self,
+        attention_mask,
+        batch_size,
+        head_dim,
+        query_states,
+        key_states,
+        value_states,
+        layer_idx: int = -1,
+        kind: str = "self",
     ):
         num_att_heads = self.num_attention_heads
         num_key_value_heads = self.num_key_value_heads
@@ -549,6 +582,9 @@ class SmolVLMWithExpertModel(nn.Module):
         big_neg = torch.finfo(att_weights.dtype).min  # -2.3819763e38  # See gemma/modules.py
         masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg)
         probs = nn.functional.softmax(masked_att_weights, dim=-1)
+        if self.attention_capture is not None:
+            # Tap point: float32 softmax output, before the cast back to the value dtype.
+            self.attention_capture(layer_idx, probs, kind)
         probs = probs.to(dtype=value_states.dtype)
 
         att_output = torch.matmul(probs, value_states.permute(0, 2, 1, 3))
