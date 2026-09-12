@@ -16,48 +16,56 @@ import numpy as np
 if TYPE_CHECKING:
     import torch
 
-_EXPLAINER_REGISTRY: dict[str, type] = {}
+_EXPLAINER_REGISTRY: dict[tuple[str, str], type] = {}
 
 
-def register_explainer(policy_type: str, explainer_cls: type | None = None):
-    """Register an Explainer class for a policy type (draccus ChoiceRegistry name).
+def register_explainer(policy_type: str, explainer_cls: type | None = None, *, method: str = "grad_x_input"):
+    """Register an Explainer class for a (policy type, method) pair.
 
-    Usable both directly (``register_explainer("smolvla", SmolVLAExplainer)``) and as a
-    decorator (``@register_explainer("smolvla")``). Refuses to overwrite an existing
-    registration — a duplicate would silently mask the first explainer.
+    ``policy_type`` is the draccus ChoiceRegistry name; ``method`` is the saliency method
+    (``--saliency.method``), defaulting to ``"grad_x_input"`` so pre-method registrations
+    keep their behavior. Usable both directly (``register_explainer("smolvla", SmolVLAExplainer)``)
+    and as a decorator (``@register_explainer("smolvla", method="attention")``). Refuses to
+    overwrite an existing registration — a duplicate would silently mask the first explainer.
     """
-    if policy_type in _EXPLAINER_REGISTRY:
-        existing = _EXPLAINER_REGISTRY[policy_type].__name__
+    key = (policy_type, method)
+    if key in _EXPLAINER_REGISTRY:
+        existing = _EXPLAINER_REGISTRY[key].__name__
         raise ValueError(
-            f"Saliency explainer already registered for policy type '{policy_type}' ({existing}); "
-            "refusing to overwrite. Register a different policy type or explainer class."
+            f"Saliency explainer already registered for policy type '{policy_type}' method "
+            f"'{method}' ({existing}); refusing to overwrite. Register a different policy type, "
+            "method, or explainer class."
         )
     if explainer_cls is None:
 
         def decorator(cls: type) -> type:
-            _EXPLAINER_REGISTRY[policy_type] = cls
+            _EXPLAINER_REGISTRY[key] = cls
             return cls
 
         return decorator
-    _EXPLAINER_REGISTRY[policy_type] = explainer_cls
+    _EXPLAINER_REGISTRY[key] = explainer_cls
     return explainer_cls
 
 
-def get_explainer_cls(policy_type: str) -> type:
-    """Look up the Explainer for a policy type. Fail fast — never silently degrade."""
+def get_explainer_cls(policy_type: str, method: str = "grad_x_input") -> type:
+    """Look up the Explainer for a (policy type, method) pair. Fail fast — never silently degrade."""
     try:
-        return _EXPLAINER_REGISTRY[policy_type]
+        return _EXPLAINER_REGISTRY[(policy_type, method)]
     except KeyError:
-        registered = ", ".join(sorted(_EXPLAINER_REGISTRY)) or "(none)"
+        registered = ", ".join(sorted(f"{t}/{m}" for t, m in _EXPLAINER_REGISTRY)) or "(none)"
         raise ValueError(
-            f"No saliency explainer registered for policy type '{policy_type}'. "
-            f"Registered types: {registered}. Implement and register an Explainer for this policy, "
+            f"No saliency explainer registered for policy type '{policy_type}' method '{method}'. "
+            f"Registered: {registered}. Implement and register an Explainer for this combination, "
             "or run without --saliency.enabled."
         ) from None
 
 
 class Explainer:
     """Base class: wraps a local policy copy and computes per-camera saliency maps."""
+
+    # Output map kind: "pixel" = full-resolution pixel sensitivity (smooth overlay),
+    # "patch" = low-resolution patch-token grid (blocky overlay with grid lines).
+    map_kind: str = "pixel"
 
     def __init__(self, policy) -> None:
         self.policy = policy

@@ -23,7 +23,9 @@ class SaliencyConfig:
 
     # Master switch. Requires a local policy with a registered Explainer and the RTC inference engine.
     enabled: bool = False
-    # Saliency method. Only "grad_x_input" is implemented today; "integrated" is a planned upgrade.
+    # Saliency method: "grad_x_input" = pixel sensitivity (∂‖a₀‖²/∂x), "attention" = patch
+    # attention map (a₀'s cross-attention share over each camera's 8×8 patch tokens).
+    # "integrated" is a planned upgrade.
     method: str = "grad_x_input"
     # Stream overlay frames to rerun entities ``saliency/<camera>`` (requires --display_data).
     display: bool = True
@@ -59,9 +61,9 @@ def validate_saliency(
             "--saliency.enabled=true currently requires --inference.type=rtc "
             "(noise injection lives in the RTC engine)"
         )
-    if saliency.method != "grad_x_input":
+    if saliency.method not in ("grad_x_input", "attention"):
         raise ValueError(
-            f"Unsupported --saliency.method={saliency.method!r} (only 'grad_x_input' is implemented)"
+            f"Unsupported --saliency.method={saliency.method!r} (implemented: 'grad_x_input', 'attention')"
         )
     if saliency.display and display_mode != "rerun":
         raise ValueError("--saliency.display=true requires --display_mode=rerun")

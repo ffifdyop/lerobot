@@ -491,3 +491,69 @@ def test_saliency_blueprint_retains_late_prediction_and_observation_views(mock_r
         "prediction.subtask", "prediction.answer"
     }
     assert {v.origin for v in _views_by_kind(latest, "Spatial2DView")} == {"saliency/cam1"}
+
+
+def test_log_rerun_saliency_budget_logs_scalars(mock_rerun):
+    """Budget shares are logged as scalars under ``saliency/budget/<segment>``."""
+    rv, calls, _blueprints = mock_rerun
+
+    rv.log_rerun_saliency_budget({"camera1": 0.5, "language": 0.4, "state": 0.1})
+
+    cam = _obj_for(calls, "saliency/budget/camera1")
+    assert type(cam).__name__ == "DummyScalar"
+    assert float(cam.value) == pytest.approx(0.5)
+    assert float(_obj_for(calls, "saliency/budget/language").value) == pytest.approx(0.4)
+    assert float(_obj_for(calls, "saliency/budget/state").value) == pytest.approx(0.1)
+    assert {"camera1", "language", "state"} == rv._SALIENCY_BUDGET_SEGMENTS
+
+
+def test_log_rerun_saliency_budget_resends_blueprint_with_timeseries_view(mock_rerun):
+    """The first budget log rebuilds the blueprint with a visible budget time-series view."""
+    rv, calls, blueprints = mock_rerun
+
+    rv.log_rerun_data(observation={"temp": 1.0}, action={"a": 2.0})
+    assert len(blueprints) == 1
+    assert "saliency/budget" not in {v.name for v in _views_by_kind(blueprints[0], "TimeSeriesView")}
+
+    budget = {"camera1": 0.5, "language": 0.4, "state": 0.1}
+    rv.log_rerun_saliency_budget(budget)  # new segments → rebuild + re-send
+    assert len(blueprints) == 2
+    ts_views = {v.name: v for v in _views_by_kind(blueprints[1], "TimeSeriesView")}
+    assert ts_views["saliency/budget"].contents == [
+        "saliency/budget/camera1",
+        "saliency/budget/language",
+        "saliency/budget/state",
+    ]
+    assert ts_views["observation"].contents == ["observation.temp"]  # stashed views preserved
+
+    rv.log_rerun_saliency_budget({"camera1": 0.6, "language": 0.3, "state": 0.1})  # no new segments
+    assert len(blueprints) == 2  # no re-send
+
+
+def test_saliency_budget_preserves_prediction_and_overlay_views(mock_rerun):
+    rv, _, blueprints = mock_rerun
+    rv.log_rerun_data(
+        observation={"temp": 1.0},
+        prediction={"language": {"subtask": ["reach"]}},
+    )
+    rv.log_rerun_saliency({"cam1": np.zeros((4, 4, 3), dtype=np.uint8)})
+    rv.log_rerun_saliency_budget({"cam1": 0.6, "language": 0.4})
+    latest = blueprints[-1]
+    assert {v.origin for v in _views_by_kind(latest, "TextDocumentView")} == {"prediction.subtask"}
+    assert {v.origin for v in _views_by_kind(latest, "Spatial2DView")} == {"saliency/cam1"}
+    series = {v.name: v.contents for v in _views_by_kind(latest, "TimeSeriesView")}
+    assert series == {
+        "observation": ["observation.temp"],
+        "saliency/budget": ["saliency/budget/cam1", "saliency/budget/language"],
+    }
+
+    rv.log_rerun_data(prediction={"language": {"answer": ["done"]}})
+    latest = blueprints[-1]
+    assert {v.origin for v in _views_by_kind(latest, "TextDocumentView")} == {
+        "prediction.subtask",
+        "prediction.answer",
+    }
+    assert {v.name for v in _views_by_kind(latest, "TimeSeriesView")} == {
+        "observation",
+        "saliency/budget",
+    }

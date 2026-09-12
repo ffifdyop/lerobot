@@ -23,15 +23,35 @@ import threading
 import cv2
 import numpy as np
 
-from lerobot.utils.rerun_visualization import log_rerun_saliency
+from lerobot.utils.rerun_visualization import log_rerun_saliency, log_rerun_saliency_budget
 
-from .overlay import render_overlay, resize_blur_map, shared_norm_range, tensor_to_uint8_bgr
+from .overlay import (
+    draw_budget_bar,
+    render_overlay,
+    render_patch_overlay,
+    resize_blur_map,
+    shared_norm_range,
+    tensor_to_uint8_bgr,
+)
 
 logger = logging.getLogger(__name__)
 
 # Per-chunk decay of the running norm max in "run" scope: at ~1.3 chunks/s a one-off spike
 # (e.g. an FP blowup in one chunk) stops suppressing the scale after ~1 minute.
 _NORM_HI_DECAY = 0.99
+
+
+def _budget_segments(budget: dict[str, float]) -> list[tuple[str, float]]:
+    """Order a five-way attention budget for the stacked bar: cameras first (insertion order,
+    short display names), then language, then state."""
+    segments = [
+        (key.rsplit(".", 1)[-1], share) for key, share in budget.items() if key not in ("language", "state")
+    ]
+    if "language" in budget:
+        segments.append(("language", budget["language"]))
+    if "state" in budget:
+        segments.append(("state", budget["state"]))
+    return segments
 
 
 class SaliencyRecorder:
@@ -47,8 +67,10 @@ class SaliencyRecorder:
         display: bool,
         display_mode: str,
         norm_scope: str = "run",
+        letterbox_hw: tuple[int, int] = (512, 512),
     ) -> None:
         self._explainer = explainer
+        self._map_kind = getattr(explainer, "map_kind", "pixel")
         self._output_dir = output_dir
         self._video_fps = video_fps
         self._alpha = alpha
@@ -56,6 +78,7 @@ class SaliencyRecorder:
         self._display = display
         self._display_mode = display_mode
         self._norm_scope = norm_scope
+        self._letterbox_hw = letterbox_hw
         self._norm_hi = 0.0  # running max for "run" scope; 0.0 = not yet initialized
         self._queue: queue.Queue = queue.Queue(maxsize=1)
         self._thread: threading.Thread | None = None
@@ -63,6 +86,7 @@ class SaliencyRecorder:
         self._writer_files: dict[str, str] = {}
         self._write_warned: set[str] = set()
         self._nonfinite_warned: set[str] = set()
+        self._budget_nonfinite_warned = False
         self._closed = False
         os.makedirs(output_dir, exist_ok=True)
 
@@ -127,9 +151,22 @@ class SaliencyRecorder:
 
     def _process(self, item: dict) -> None:
         maps = self._explainer.compute_saliency(item["preprocessed"], item["noise"], item["chunk_kwargs"])
-        # Pass 1: validate + convert frames + blur maps (bounds must span the values actually
-        # displayed, so blur happens before the shared min-max is taken).
-        prepared: list[tuple[str, np.ndarray, np.ndarray]] = []  # (cam_key, frame_bgr, blurred map)
+        # Patch explainers also expose a five-way attention budget (same thread — no race).
+        budget = getattr(self._explainer, "last_budget", None) if self._map_kind == "patch" else None
+        if budget is not None and not all(np.isfinite(v) for v in budget.values()):
+            # A budget NaN (FP blowup in language/state columns) would raise inside
+            # draw_budget_bar and cost the whole frame; drop just the bar/curves instead,
+            # mirroring the per-camera NaN guard below.
+            if not self._budget_nonfinite_warned:
+                self._budget_nonfinite_warned = True
+                logger.warning(
+                    "Non-finite attention budget; dropping the budget bar/curves for affected frames"
+                )
+            budget = None
+        # Pass 1: validate + convert frames + prepare maps for display. Pixel maps are blurred
+        # before the shared min-max so bounds span the values actually displayed; patch maps
+        # stay blocky (never blurred) and are normalized as-is.
+        prepared: list[tuple[str, np.ndarray, np.ndarray]] = []  # (cam_key, frame_bgr, display map)
         for cam_key, sal in maps.items():
             if not np.isfinite(sal).all():
                 # NaN/Inf gradients would flow silently through min-max normalization into
@@ -142,7 +179,10 @@ class SaliencyRecorder:
                     )
                 continue
             frame = tensor_to_uint8_bgr(item["preprocessed"][cam_key])
-            prepared.append((cam_key, frame, resize_blur_map(sal, frame.shape[:2], self._blur_sigma)))
+            if self._map_kind == "patch":
+                prepared.append((cam_key, frame, sal.astype(np.float32)))
+            else:
+                prepared.append((cam_key, frame, resize_blur_map(sal, frame.shape[:2], self._blur_sigma)))
         if not prepared:
             return
         if self._norm_scope == "run":
@@ -157,9 +197,19 @@ class SaliencyRecorder:
             # a camera that contributed little stays dark instead of being stretched to full
             # red by a private per-camera min-max.
             norm_range = shared_norm_range(m for _, _, m in prepared)
+        budget_segments = _budget_segments(budget) if budget is not None else None
         rerun_frames: dict[str, np.ndarray] = {}
-        for cam_key, frame, blurred in prepared:
-            overlay = render_overlay(frame, blurred, self._alpha, blur_sigma=0.0, norm_range=norm_range)
+        for cam_key, frame, display_map in prepared:
+            if self._map_kind == "patch":
+                overlay = render_patch_overlay(
+                    frame, display_map, self._alpha, norm_range=norm_range, letterbox_hw=self._letterbox_hw
+                )
+                if budget_segments is not None:
+                    overlay = draw_budget_bar(overlay, budget_segments)
+            else:
+                overlay = render_overlay(
+                    frame, display_map, self._alpha, blur_sigma=0.0, norm_range=norm_range
+                )
             # Some OpenCV builds return a bool from write(), None on others; a False means the
             # frame was silently dropped (e.g. resolution changed mid-video → frozen mp4).
             ret = self._writer(cam_key, overlay.shape[1], overlay.shape[0]).write(overlay)
@@ -170,6 +220,8 @@ class SaliencyRecorder:
                 rerun_frames[cam_key.rsplit(".", 1)[-1]] = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
         if rerun_frames:
             log_rerun_saliency(rerun_frames)
+        if self._display and self._display_mode == "rerun" and budget is not None:
+            log_rerun_saliency_budget({k.rsplit(".", 1)[-1]: v for k, v in budget.items()})
 
     def _writer(self, cam_key: str, width: int, height: int):
         if cam_key in self._writers:

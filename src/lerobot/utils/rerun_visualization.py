@@ -64,6 +64,7 @@ def init_rerun(
     log_rerun_data.blueprint_paths = None  # type: ignore[attr-defined]
     _IMAGE_SIZES.clear()
     _SALIENCY_PATHS.clear()  # saliency paths belong to the old session too
+    _SALIENCY_BUDGET_SEGMENTS.clear()
 
     batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "8000")
     os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
@@ -113,12 +114,24 @@ def _build_blueprint(
         views.append(rrb.TimeSeriesView(name="action", contents=sorted(action_paths)))
     views += [rrb.TextDocumentView(origin=path, name=path) for path in sorted(text_paths)]
 
+    if _SALIENCY_BUDGET_SEGMENTS:
+        views.append(
+            rrb.TimeSeriesView(
+                name="saliency/budget",
+                contents=sorted(f"saliency/budget/{seg}" for seg in _SALIENCY_BUDGET_SEGMENTS.copy()),
+            )
+        )
+
     return rrb.Blueprint(rrb.Grid(*views))
 
 
 # Saliency overlay entity paths seen so far; the blueprint is rebuilt whenever
 # a new camera arrives, while retaining all observation and prediction panels.
 _SALIENCY_PATHS: set[str] = set()
+
+# Attention-budget segment names seen so far (camera short names + "language"/"state"); same
+# rebuild-on-first-arrival pattern as _SALIENCY_PATHS so the budget time series shows up unprompted.
+_SALIENCY_BUDGET_SEGMENTS: set[str] = set()
 
 
 def _ensure_blueprint(
@@ -321,6 +334,30 @@ def log_rerun_saliency(saliency_frames: dict[str, np.ndarray]) -> None:
     if new_paths and getattr(log_rerun_data, "blueprint", None) is not None:
         # The observation blueprint already ran (before the first saliency frame landed);
         # rebuild it from the stashed path sets so the new overlay views are included.
+        paths = getattr(log_rerun_data, "blueprint_paths", None)
+        if paths is None:
+            paths = (set(), set(), set(), set())
+        blueprint = _build_blueprint(*paths)
+        log_rerun_data.blueprint = blueprint  # type: ignore[attr-defined]
+        rr.send_blueprint(blueprint)
+
+
+def log_rerun_saliency_budget(budget: dict[str, float]) -> None:
+    """Log attention-budget shares under ``saliency/budget/<segment>`` scalar entities.
+
+    ``budget`` maps segment names (camera short names, "language", "state") to attention
+    mass shares in [0, 1]. The blueprint gains a ``saliency/budget`` time-series view on
+    the first call (same rebuild-on-arrival pattern as :func:`log_rerun_saliency`).
+    """
+    require_package("rerun-sdk", extra="viz", import_name="rerun")
+    import rerun as rr
+
+    for segment, share in budget.items():
+        rr.log(f"saliency/budget/{segment}", rr.Scalars(float(share)))
+
+    new_segments = set(budget) - _SALIENCY_BUDGET_SEGMENTS
+    _SALIENCY_BUDGET_SEGMENTS.update(budget)
+    if new_segments and getattr(log_rerun_data, "blueprint", None) is not None:
         paths = getattr(log_rerun_data, "blueprint_paths", None)
         if paths is None:
             paths = (set(), set(), set(), set())

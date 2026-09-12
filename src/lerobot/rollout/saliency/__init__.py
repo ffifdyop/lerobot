@@ -10,5 +10,13 @@
 from .config import SaliencyConfig
 from .explainer import Explainer, get_explainer_cls, register_explainer
 from .smolvla import SmolVLAExplainer
+from .smolvla_attention import SmolVLAAttentionExplainer
 
-__all__ = ["Explainer", "SaliencyConfig", "SmolVLAExplainer", "get_explainer_cls", "register_explainer"]
+__all__ = [
+    "Explainer",
+    "SaliencyConfig",
+    "SmolVLAAttentionExplainer",
+    "SmolVLAExplainer",
+    "get_explainer_cls",
+    "register_explainer",
+]
