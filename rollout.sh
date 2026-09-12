@@ -87,12 +87,20 @@ lerobot-rollout \
   --robot.cameras="$TOP_CAMERAS" \
   --rename_map="$RENAME_MAP" \
   --task="fold the garment on the table" \
-  --duration=360
-
-  # --- 可选：saliency 叠加热力图视频（每相机一个 mp4 + rerun 实时叠加画面） ---
-  # 启用前提：① 第 5 行 CUDA_VISIBLE_DEVICES 需改成多卡掩码（如 "2,3"），否则
-  #   进程内只见一张卡，explainer 副本将与策略共卡；② 取消下面两行注释。
-  # 产物目录：outputs/saliency/<时间戳>/{camera1,camera2,camera3}.mp4
-  # --saliency.enabled=true \
-  # --display_data=true --display_mode=rerun \
+  --duration=360 \
+  --saliency.enabled=true \
+  --saliency.method=attention \
+  --saliency.video_fps=1 \
+  --display_data=true --display_mode=rerun \
+  # --- saliency 叠加热力图（上面四行已启用）---
+  # 前提：第 5 行 CUDA_VISIBLE_DEVICES 是多卡掩码（explainer 副本跑第二张卡）。
+  # method=attention（当前）：动作 token a₀ 的交叉注意力落在哪些 patch 上 ——
+  #   每相机 8×8 Patch 注意力图（块状+网格线，原始份额、跨相机可比，不重归一化），
+  #   帧顶注意力预算条（相机/语言/state 五份，总和=1）+ rerun 曲线 saliency/budget/*。
+  # 切回像素敏感度图（∂‖a₀‖²/∂x）：--saliency.method=grad_x_input
+  # 产物：outputs/saliency/<时间戳>/{camera1,camera2,camera3}.mp4
+  #   （快照每个 chunk 一帧 ≈1.3 帧/s，video_fps=1 让播放节奏≈真实节奏）
+  # 色标：默认全程统一尺度（norm_scope=run：跨相机、跨时刻可比）；
+  #   想恢复逐 chunk 自适应对比度（局部对比最强，但"平静时刻"也会被拉红）：
+  #   --saliency.norm_scope=chunk
 
