@@ -2,7 +2,7 @@ source .venv/bin/activate
 
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=2,3
 
 # 左从臂串口
 LEFT_FOLLOWER_PORT="/dev/ttyACM2"
@@ -67,8 +67,10 @@ TOP_CAMERAS='{
 # rename step（传空等于清空），不存在"自动加载 checkpoint 里的 map"。
 RENAME_MAP='{"observation.images.top":"observation.images.camera1","observation.images.left_wrist":"observation.images.camera2","observation.images.right_wrist":"observation.images.camera3"}'
 # RENAME_MAP='{"observation.images.top":"observation.images.base_0_rgb","observation.images.left_wrist":"observation.images.left_wrist_0_rgb","observation.images.right_wrist":"observation.images.right_wrist_0_rgb"}'
-POLICY_PATH=models/train/smolvla/smolvla-real_720p_ft_20260902_105132/checkpoints/080000/pretrained_model
-#POLICY_PATH=models/train/smolvla/smolvla-real_720p_ft_20260830_142257/checkpoints/last/pretrained_model
+# POLICY_PATH=models/lehome/train/smolvla/smolvla-real_720p_ft_no-wrist_20260912_205349/checkpoints/040000/pretrained_model
+POLICY_PATH=models/lehome/train/smolvla/smolvla-real_720p_ft_enhanced_20260913_144858/checkpoints/040000/pretrained_model
+# POLICY_PATH=models/lehome/train/smolvla/smolvla-real_720p_ft_20260902_105132/checkpoints/080000/pretrained_model
+# POLICY_PATH=models/train/smolvla/smolvla-real_720p_ft_20260830_142257/checkpoints/last/pretrained_model
 # POLICY_PATH=models/train/pi05/pi05-real_ft_20260701_202015/checkpoints/040000/pretrained_model
 
 lerobot-rollout \
@@ -92,6 +94,7 @@ lerobot-rollout \
   --saliency.method=attention \
   --saliency.video_fps=1 \
   --display_data=true --display_mode=rerun \
+
   # --- saliency 叠加热力图（上面四行已启用）---
   # 前提：第 5 行 CUDA_VISIBLE_DEVICES 是多卡掩码（explainer 副本跑第二张卡）。
   # method=attention（当前）：动作 token a₀ 的交叉注意力落在哪些 patch 上 ——
