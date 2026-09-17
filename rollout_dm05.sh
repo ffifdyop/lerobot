@@ -69,6 +69,7 @@ TOP_CAMERAS='{
 
 echo "[步骤 4/4] 启动 rollout..."
 
+# DM05 当前不支持 saliency；这里只显示原始相机、机器人状态和动作曲线。
 lerobot-rollout \
   --strategy.type=base \
   --policy.path=$POLICY_PATH \
@@ -83,4 +84,6 @@ lerobot-rollout \
   --robot.right_arm_config.cameras="$RIGHT_CAMERAS" \
   --robot.cameras="$TOP_CAMERAS" \
   --task="fold the garment on the table" \
-  --duration=360
+  --duration=360 \
+  --display_data=true \
+  --display_mode=rerun

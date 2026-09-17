@@ -189,3 +189,4 @@ models/lehome
 .kimi/
 .github/prompts/
 .github/skills/
+.agents/
