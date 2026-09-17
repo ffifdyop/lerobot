@@ -49,6 +49,7 @@ from lerobot.processor import (
 from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
 from lerobot.robots import make_robot_from_config
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
+from lerobot.utils.constants import ACTION
 from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
 from lerobot.utils.import_utils import _peft_available, require_package
 
@@ -498,10 +499,14 @@ def build_rollout_context(
         )
         dataset_features = combine_feature_dicts(action_dataset_features, observation_dataset_features)
         hw_features = hw_to_dataset_features(observation_features_hw, "observation")
-        raw_action_keys = list(action_features_hw.keys())
+        # The policy-facing action space is what teleop_action_processor produces (identity
+        # for joint-space policies, ee keys for EE policies), so order actions by
+        # dataset_features[ACTION] names rather than the raw hardware keys. With an identity
+        # teleop processor the two coincide, keeping joint-space rollouts unchanged.
+        policy_action_space_keys = list(dataset_features[ACTION].get("names") or action_features_hw.keys())
         ordered_action_keys = _resolve_action_key_order(
             list(policy_action_names) if policy_action_names else None,
-            raw_action_keys,
+            policy_action_space_keys,
         )
 
         # Validate visual features if no rename_map is active

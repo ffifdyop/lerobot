@@ -235,6 +235,7 @@ class RTCInferenceEngine(InferenceEngine):
         compile_warmup_inferences: int = 2,
         rtc_queue_threshold: int = 30,
         shutdown_event: Event | None = None,
+        dataset_features: dict | None = None,
     ) -> None:
         super().__init__(task=task)
         self._policy = policy
@@ -243,6 +244,12 @@ class RTCInferenceEngine(InferenceEngine):
         self._robot = robot_wrapper
         self._rtc_config = rtc_config
         self._hw_features = hw_features
+        # Policy-facing observation features (after robot_observation_processor). Needed by
+        # build_dataset_frame: with an EE observation processor the processed observation no
+        # longer carries the raw hardware joint keys, so hw_features cannot index into it.
+        # With an identity processor (or no dataset features supplied) the two are identical
+        # and joint-space rollouts are unchanged.
+        self._dataset_features = dataset_features if dataset_features is not None else hw_features
         self._fps = fps
         self._device = device or "cpu"
         self._use_torch_compile = use_torch_compile
@@ -430,7 +437,7 @@ class RTCInferenceEngine(InferenceEngine):
 
     def _generate_text(self, obs_processed: dict, query: PolicyQuery) -> str:
         """Run the policy's text head.  Called on the RTC thread (see ``_rtc_loop``)."""
-        obs_batch = build_dataset_frame(self._hw_features, obs_processed, prefix="observation")
+        obs_batch = build_dataset_frame(self._dataset_features, obs_processed, prefix="observation")
         # Live task, read without consuming the task-changed edge: that belongs to the
         # chunk path.
         task = self.task
@@ -520,7 +527,7 @@ class RTCInferenceEngine(InferenceEngine):
                             # inference; with blending off the queue drains first.
                             logger.info("Task changed to '%s' — applied from the next merged chunk", task)
 
-                        obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
+                        obs_batch = build_dataset_frame(self._dataset_features, obs, prefix="observation")
                         obs_batch = prepare_observation_for_inference(
                             obs_batch, policy_device, task, self._robot.robot_type
                         )
