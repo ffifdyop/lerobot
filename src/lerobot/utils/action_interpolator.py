@@ -64,6 +64,9 @@ class ActionInterpolator:
         self._buffer: list[Tensor] = []
         self._idx = 0
         self._emitted_policy_action = False
+        # The most recent action actually handed to the robot, kept across a flush so a
+        # View Mask transition can hold position instead of coasting on stale actions.
+        self._last_sent: Tensor | None = None
 
     @property
     def enabled(self) -> bool:
@@ -93,6 +96,34 @@ class ActionInterpolator:
         self._buffer = []
         self._idx = 0
         self._emitted_policy_action = False
+        self._last_sent = None
+
+    def flush(self) -> Tensor | None:
+        """Drop the not-yet-sent interpolated tail, keeping the last sent action as hold.
+
+        Used by a View Mask transition: the remaining interpolated steps were derived
+        from actions generated under the previous mask, so continuing to emit them
+        would move the robot along a stale trajectory.  The robot instead holds the
+        last action it actually received (:meth:`last_sent`) until a fresh one
+        arrives; a later :meth:`add` interpolates from that same value, so motion
+        resumes continuously rather than jumping.
+
+        Returns the held action, or ``None`` if nothing was ever sent.
+        """
+        # ``_prev`` is the endpoint of the whole chunk that was most recently
+        # added.  It may be several interpolation steps ahead of the action that
+        # actually reached the robot.  After discarding the tail, only the last
+        # command we really sent is a safe interpolation anchor.
+        hold = self.last_sent()
+        self._prev = None if hold is None else hold.clone()
+        self._buffer = []
+        self._idx = 0
+        self._emitted_policy_action = False
+        return hold
+
+    def last_sent(self) -> Tensor | None:
+        """The most recent action handed out by :meth:`get` (the hold value)."""
+        return None if self._last_sent is None else self._last_sent.clone()
 
     def needs_new_action(self) -> bool:
         """Check if a new action is needed from the queue."""
@@ -131,6 +162,7 @@ class ActionInterpolator:
             self._emitted_policy_action = False
             return None
         action = self._buffer[self._idx]
+        self._last_sent = action
         self._idx += 1
         self._emitted_policy_action = self._idx == len(self._buffer)
         return action

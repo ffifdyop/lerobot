@@ -98,4 +98,5 @@ lerobot-rollout \
   --task="fold the garment on the table" \
   --duration=360 \
   --display_data=true \
-  --display_mode=rerun
+  --display_mode=rerun \
+  --view_mask.enabled=true

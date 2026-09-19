@@ -60,6 +60,11 @@ LANGUAGE_PERSISTENT: Final = "language_persistent"
 LANGUAGE_EVENTS: Final = "language_events"
 MESSAGES_RENDERED = "messages_rendered"
 
+# Optional per-inference metadata carried through the processor transition.  The
+# container is intentionally generic so rollout-only capabilities do not each add
+# their own keys to the shared constants namespace.
+RUNTIME_CONTEXT = "__runtime_context__"
+
 ROBOTS = "robots"
 TELEOPERATORS = "teleoperators"
 

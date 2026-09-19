@@ -201,3 +201,24 @@ def draw_budget_bar(
     if bh < fh:
         cv2.line(out, (0, bh - 1), (fw - 1, bh - 1), (32, 32, 32), 1)
     return out
+
+
+def draw_masked_badge(img_bgr: np.ndarray, label: str = "MASKED") -> np.ndarray:
+    """Burn a red ``MASKED`` badge into the top-left corner of a frame.
+
+    View ablation keeps a masked view's *real* saliency: the policy still sees a
+    (black) image token, so its gradients and attention are genuine non-zero
+    measurements, not to be zeroed or hidden.  The badge exists so nobody reads the
+    heatmap over a black frame as evidence about visible pixels.
+    """
+    out = img_bgr.copy()
+    pad, scale, thick = 4, 0.5, 2
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+    x0, y0 = 4, 4
+    x1, y1 = min(x0 + tw + 2 * pad, out.shape[1] - 1), min(y0 + th + 2 * pad, out.shape[0] - 1)
+    # Filled red plate with a white outline: legible over heatmap colours, black frames
+    # and bright camera images alike.
+    cv2.rectangle(out, (x0, y0), (x1, y1), (0, 0, 220), thickness=-1)
+    cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), thickness=1)
+    cv2.putText(out, label, (x0 + pad, y1 - pad), cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), thick)
+    return out

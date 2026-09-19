@@ -112,6 +112,14 @@ class SaliencyManager:
         """Sink entry point called by the RTC engine (drop-oldest, never blocks)."""
         self._recorder.submit(snapshot)
 
+    def set_view_mask(self, runtime) -> None:
+        """Bind the session's View Mask runtime so stale revisions can be filtered.
+
+        A snapshot computed under revision N must not be published once the mask has
+        moved on: the overlay would describe a scene the operator already changed.
+        """
+        self._recorder.set_view_mask(runtime)
+
     def stop(self) -> None:
         """Flush and close the overlay videos, and detach any model tap the explainer holds."""
         self._recorder.close()

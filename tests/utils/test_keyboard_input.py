@@ -30,6 +30,7 @@ import pytest
 
 import lerobot.utils.keyboard_input as ki
 from lerobot.utils.keyboard_input import (
+    LatchingKeyListener,
     TerminalKeyListener,
     apply_recording_control,
     create_key_listener,
@@ -163,6 +164,8 @@ def _drive(listener, byte_seq):
         (["\x1b", "O", "D"], ["left"]),  # SS3 arrow (e.g. over SSH/tmux)
         (["\x1b"], ["esc"]),  # bare ESC
         (["\x1b", "[", "A"], ["up"]),  # decoded even though the record handler ignores it
+        (["\x1b", "[", "2", "4", "~"], ["f12"]),  # extended CSI function key
+        (["\x1b", "[", "3", "4", "~"], ["f20"]),  # highest default View Mask binding
         (["n"], ["n"]),  # letter passthrough
     ],
 )
@@ -226,3 +229,20 @@ def test_create_key_listener_none_without_tty(monkeypatch):
     monkeypatch.setattr(ki, "pynput_can_capture", lambda: False)
     _set_tty(monkeypatch, is_tty=False)
     assert create_key_listener(lambda name: None) is None
+
+
+def test_terminal_latching_refreshes_the_repeat_window(monkeypatch):
+    """A long auto-repeat stream stays one toggle when terminal has no key-up event."""
+    now = iter([0.0, 0.5, 1.0, 2.0])
+    monkeypatch.setattr(ki.time, "monotonic", lambda: next(now))
+    seen = []
+    listener = LatchingKeyListener(seen.append, releases_available=False, terminal_repeat_window_s=0.75)
+
+    listener.on_press("f1")
+    listener.on_press("f1")
+    listener.on_press("f1")
+    assert seen == ["f1"]
+
+    # A real second press after an inactivity gap is still accepted.
+    listener.on_press("f1")
+    assert seen == ["f1", "f1"]
