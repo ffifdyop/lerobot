@@ -49,6 +49,14 @@ def mock_rerun(monkeypatch):
         def compress(self, *a, **k):
             return self
 
+    class DummyTextLog:
+        def __init__(self, text):
+            self.text = text
+
+    class DummyBoxes2D:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
     class DummyDepthImage:
         def __init__(self, arr, meter=None, colormap=None):
             self.arr = arr
@@ -82,6 +90,8 @@ def mock_rerun(monkeypatch):
         __spec__=SimpleNamespace(name="rerun", submodule_search_locations=None),
         Scalars=DummyScalar,
         Image=DummyImage,
+        TextLog=DummyTextLog,
+        Boxes2D=DummyBoxes2D,
         DepthImage=DummyDepthImage,
         components=SimpleNamespace(Colormap=SimpleNamespace(Viridis="viridis")),
         log=dummy_log,
@@ -389,3 +399,55 @@ def test_log_rerun_saliency_budget_resends_blueprint_with_timeseries_view(mock_r
 
     rv.log_rerun_saliency_budget({"camera1": 0.6, "language": 0.3, "state": 0.1})  # no new segments
     assert len(blueprints) == 2  # no re-send
+
+
+def test_view_mask_status_does_not_copy_or_log_full_resolution_images(mock_rerun):
+    rv, calls, _blueprints = mock_rerun
+    frame = np.ones((8, 8, 3), dtype=np.uint8)
+
+    rv.log_rerun_view_mask(
+        {"observation.images.front": True},
+        revision=1,
+        state="applying",
+        observation={"observation.images.front": frame},
+    )
+
+    assert not any(type(obj).__name__ == "DummyImage" for _, obj, _ in calls)
+    assert any(
+        key == "observation.images.front" and type(obj).__name__ == "DummyBoxes2D"
+        for key, obj, _ in calls
+    )
+
+
+def test_view_mask_status_uses_raw_display_path_after_rename(mock_rerun):
+    rv, calls, _blueprints = mock_rerun
+    frame = np.ones((8, 8, 3), dtype=np.uint8)
+
+    rv.log_rerun_view_mask(
+        {"observation.images.cam_high": True},
+        revision=1,
+        state="applying",
+        observation={"front": frame},
+        display_paths={"observation.images.cam_high": "front"},
+    )
+
+    assert any(
+        key == "observation.front" and type(obj).__name__ == "DummyBoxes2D"
+        for key, obj, _ in calls
+    )
+
+
+def test_view_mask_label_anchor_is_inset_from_left_edge(mock_rerun):
+    rv, calls, _blueprints = mock_rerun
+    frame = np.ones((8, 8, 3), dtype=np.uint8)
+
+    rv.log_rerun_view_mask(
+        {"observation.images.front": False},
+        revision=0,
+        state="active",
+        observation={"observation.images.front": frame},
+    )
+
+    badge = _obj_for(calls, "observation.images.front")
+    assert badge.kwargs["labels"] == ["VISIBLE"]
+    assert badge.kwargs["mins"] == [[64, 0]]

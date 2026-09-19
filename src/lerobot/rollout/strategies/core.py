@@ -30,6 +30,7 @@ from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.visualization_utils import log_visualization_data
 
 from ..inference import InferenceEngine
+from ..view_mask.telemetry import log_status as log_view_mask_status
 
 if TYPE_CHECKING:
     from ..configs import RolloutStrategyConfig
@@ -68,6 +69,10 @@ class RolloutStrategy(abc.ABC):
         self._interpolator: ActionInterpolator | None = None
         self._warmup_flushed: bool = False
         self._cached_obs_processed: dict | None = None
+        # View ablation is inert unless _attach_view_mask finds a runtime on the
+        # context, so these stay None on an ordinary rollout.
+        self._view_mask = None
+        self._view_mask_dataset = None
 
     def _init_engine(self, ctx: RolloutContext) -> None:
         """Attach the inference engine and action interpolator, then start the backend.
@@ -100,6 +105,131 @@ class RolloutStrategy(abc.ABC):
         if self._interpolator is not None:
             self._interpolator.reset()
         self._cached_obs_processed = None
+
+    # ------------------------------------------------------------------
+    # View ablation
+    # ------------------------------------------------------------------
+
+    def _attach_view_mask(self, ctx: RolloutContext) -> None:
+        """Bind the session's View Mask runtime and register the strategy-owned flush.
+
+        The engine owns the policy/queue half of the Inference Flush; the action
+        interpolator belongs to the strategy, so the strategy registers that half
+        here.  A no-op when ``--view_mask.enabled=false``.
+        """
+        runtime = getattr(ctx.policy, "view_mask", None)
+        if runtime is None:
+            return
+        self._view_mask = runtime
+        runtime.controller.set_sink(self._engine)
+        runtime.add_flush_hook(self._flush_view_mask_actions)
+
+    def _flush_view_mask_actions(self, transition) -> None:
+        """Discard interpolated steps that were derived from the previous mask.
+
+        The robot keeps holding the runtime's ``hold_action`` — the last action it
+        actually received — until a fresh one lands, rather than coasting along a
+        trajectory planned for a scene that no longer applies.
+        """
+        if self._interpolator is None:
+            return
+        runtime = getattr(self._engine, "view_mask", None)
+        if runtime is not None:
+            runtime.hold_action = self._interpolator.last_sent()
+        self._interpolator.flush()
+        # The cached processed observation belongs to the old mask's tick; drop it so
+        # the next policy tick re-processes the observation under the new mask.
+        self._cached_obs_processed = None
+
+    def _view_mask_tick(
+        self,
+        ctx: RolloutContext,
+        *,
+        runnable: bool,
+        phase: str | None = None,
+    ) -> bool:
+        """One View Mask tick: charge the timeout, commit pending changes.
+
+        Returns ``True`` when the caller must not trust the policy this tick — either
+        because a transition just committed (``APPLYING``, holding the last action) or
+        because the mask is latched ``FAILED`` (which the caller must surface).  A
+        no-op returning ``False`` when view ablation is disabled.
+        """
+        runtime = self._view_mask
+        if runtime is None:
+            return False
+        if self._engine is not None and self._engine.failed and not runtime.failed:
+            # An inference failure while a transition is pending means no fresh action
+            # is ever coming: latch FAILED rather than waiting out the whole timeout.
+            runtime.mark_failed("policy inference failed while a view mask transition was pending")
+        transition = runtime.poll(runnable=runnable, phase=phase)
+        if transition is None:
+            return runtime.blocked
+        self._record_view_mask_transition(runtime, transition)
+        return True
+
+    def _view_mask_frame_fields(self, *, human: bool) -> dict | None:
+        """Dataset mask fields for a frame about to be recorded, or ``None`` to skip it.
+
+        A Policy frame is labelled from the *dispatched action's* provenance, never
+        from the controller's live value: under RTC the action being recorded was
+        generated up to a chunk ago, and the mask may already have moved on.  A Human
+        frame has no action of its own, so it carries the live snapshot — the mask on
+        the observation the shadow policy was conditioned on.
+
+        Returns ``None`` during APPLYING/FAILED: those ticks only hold the last
+        action, and recording them would teach the policy that a held action was the
+        right response to the current observation.
+        """
+        runtime = self._view_mask
+        if runtime is None:
+            return None
+        if runtime.blocked:
+            return None
+        snapshot = runtime.current if human else runtime.dispatched
+        return runtime.frame_fields(snapshot)
+
+    def _human_view_mask_fields(self) -> dict | None:
+        """Mask fields for a Human frame, or ``None`` when view ablation is off.
+
+        Human control may continue while the policy is blocked, but blocked ticks
+        are not training samples.  The mask state is still available to telemetry
+        and the sidecar; it is only omitted from the dataset frame.
+        """
+        runtime = self._view_mask
+        if runtime is None or runtime.blocked:
+            return None
+        return runtime.frame_fields(runtime.current)
+
+    def _view_mask_failed_should_stop(self, _ctx: RolloutContext) -> bool:
+        """Whether the current segment should end after View Mask FAILED.
+
+        Ending the segment in both modes lets the controller surface one failure event
+        and return to its idle command loop.  Interactive recovery still works through
+        ``/reset``; it no longer requires a failed strategy loop to spin forever.
+        """
+        return self._view_mask is not None and self._view_mask.failed
+
+    def _note_recorded_frame(self, dataset) -> None:
+        """Keep the sidecar's alignment hint pointing at the last frame actually recorded."""
+        if self._view_mask is None:
+            return
+        self._view_mask.note_frame(
+            episode_index=getattr(dataset, "num_episodes", None),
+            frame_index=getattr(dataset, "num_frames", None),
+        )
+
+    def _record_view_mask_transition(self, runtime, transition) -> None:
+        """Alignment hint: where the event landed relative to the dataset timeline.
+
+        The counters read here are the ones from the last recorded frame, because the
+        transition has no frame of its own — it happened *between* frames, and the
+        sidecar's job is to say exactly that rather than to invent a timestamp.
+        """
+        dataset = self._view_mask_dataset
+        if dataset is None:
+            return
+        self._note_recorded_frame(dataset)
 
     def _process_observation_and_notify(self, processors: ProcessorContext, obs_raw: dict) -> dict:
         """Run the observation processor and notify the engine — throttled to policy ticks.
@@ -211,6 +341,25 @@ class RolloutStrategy(abc.ABC):
             action=action_dict,
             compress_images=cfg.display_compressed_images,
         )
+
+    def _log_view_mask(self, runtime_ctx: RuntimeContext) -> None:
+        """Publish the View Mask status to the display backend, when one is active.
+
+        Deliberately gated on ``display_data``: the display is a monitor, never a
+        control surface, so turning it off must leave ablation fully functional.  The
+        terminal log remains the authoritative record either way.
+        """
+        runtime = self._view_mask
+        if runtime is None or not runtime_ctx.cfg.display_data:
+            return
+        try:
+            log_view_mask_status(
+                runtime_ctx.cfg.display_mode,
+                observation=self._cached_obs_processed,
+                **runtime.telemetry(),
+            )
+        except Exception:  # a display failure must never take the control loop down
+            logger.exception("Failed to publish view mask status to the display backend")
 
     @abc.abstractmethod
     def setup(self, ctx: RolloutContext) -> None:
@@ -359,11 +508,48 @@ def send_next_action(
     if interp is None:
         if timer is not None:
             timer.note_starved_tick()
-        return None
+        # A View Mask transition cleared the interpolated tail: hold the last action
+        # the robot actually received until a fresh one is available.
+        return hold_last_action(ctx, obs_raw, section)
 
     if len(interp) != len(ordered_keys):
         raise ValueError(f"Interpolated tensor length ({len(interp)}) != action keys ({len(ordered_keys)})")
     action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
+    with section("send"):
+        processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
+        ctx.hardware.robot_wrapper.send_action(processed)
+    return action_dict
+
+
+def hold_last_action(ctx: RolloutContext, obs_raw: dict, section) -> dict | None:
+    """Send a safe hold command while a mask transition has no fresh action.
+
+    Only View Ablation uses this: without a transition the engine being starved is an
+    ordinary condition that the strategies treat as "send nothing".  With one, the
+    alternative to holding is leaving the robot uncommanded for the whole APPLYING
+    window.  Position actions can be repeated safely; velocity and delta actions
+    must be zeroed instead of replaying a stale command.  Unknown action semantics
+    are left untouched (no command is sent) rather than guessed.
+
+    Returns ``None`` — meaning "send nothing" — whenever view ablation is off or the
+    mask is not blocking, so this is a no-op for every ordinary rollout.
+    """
+    runtime = getattr(ctx.policy, "view_mask", None)
+    if runtime is None or not runtime.blocked or runtime.hold_action is None:
+        return None
+    hold = runtime.hold_action
+    action_dict = {}
+    for i, key in enumerate(ctx.data.ordered_action_keys):
+        if key.endswith((".vel", ".velocity", ".delta")):
+            action_dict[key] = 0.0
+        elif key.endswith((".pos", ".position")):
+            action_dict[key] = hold[i].item()
+        else:
+            logger.warning(
+                "Cannot safely hold action key %r during View Mask transition; skipping hold command",
+                key,
+            )
+            return None
     with section("send"):
         processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
         ctx.hardware.robot_wrapper.send_action(processed)

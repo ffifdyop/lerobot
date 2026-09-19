@@ -21,6 +21,7 @@ importing from here directly. Requires the ``viz`` extra (``pip install 'lerobot
 
 import numbers
 import os
+from collections.abc import Iterable
 
 import numpy as np
 
@@ -55,6 +56,8 @@ def init_rerun(
     log_rerun_data.blueprint = None  # Reset blueprint cache for new session
     _SALIENCY_PATHS.clear()  # saliency paths belong to the old session too
     _SALIENCY_BUDGET_SEGMENTS.clear()
+    global _VIEW_MASK_LAST_STATUS
+    _VIEW_MASK_LAST_STATUS = None
 
     batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "8000")
     os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
@@ -91,7 +94,6 @@ def _build_blueprint(observation_paths: set[str], action_paths: set[str], image_
         rrb.Spatial2DView(origin=f"saliency/{cam}", name=f"saliency/{cam}")
         for cam in sorted(_SALIENCY_PATHS.copy())
     )
-
     if observation_paths:
         views.append(rrb.TimeSeriesView(name="observation", contents=sorted(observation_paths)))
     if action_paths:
@@ -114,6 +116,11 @@ _SALIENCY_PATHS: set[str] = set()
 # Attention-budget segment names seen so far (camera short names + "language"/"state"); same
 # rebuild-on-first-arrival pattern as _SALIENCY_PATHS so the budget time series shows up unprompted.
 _SALIENCY_BUDGET_SEGMENTS: set[str] = set()
+
+# Last display state used to annotate camera entities.  The control loop may call
+# the status logger every tick, but the text annotation is emitted only when the
+# mask/revision/state actually changes.
+_VIEW_MASK_LAST_STATUS: tuple | None = None
 
 
 def _ensure_blueprint(observation_paths: set[str], action_paths: set[str], image_paths: set[str]) -> None:
@@ -214,6 +221,90 @@ def log_rerun_data(
                 action_paths.add(key)
 
     _ensure_blueprint(observation_paths, action_paths, image_paths)
+
+
+def log_rerun_view_mask(
+    masked: dict[str, bool],
+    *,
+    revision: int,
+    state: str,
+    observation: RobotObservation | None = None,
+    display_paths: dict[str, str] | None = None,
+) -> None:
+    """Publish the View Mask status: per-view 0/1, revision, and application state.
+
+    Display-only.  Called on the control loop while the mask is enabled; a no-op when
+    rerun is not the active backend (the caller checks ``display_data``/``display_mode``
+    so viewing never becomes a prerequisite for ablation to work).
+    """
+    require_package("rerun-sdk", extra="viz", import_name="rerun")
+    import rerun as rr
+
+    global _VIEW_MASK_LAST_STATUS
+    for view, is_masked in masked.items():
+        rr.log(f"view_mask/{view.rsplit('.', 1)[-1]}", rr.Scalars(1.0 if is_masked else 0.0))
+    rr.log("view_mask/revision", rr.Scalars(float(revision)))
+    rr.log("view_mask/state", rr.TextLog(state))
+
+    status = (tuple(sorted(masked.items())), revision, state)
+    if status != _VIEW_MASK_LAST_STATUS:
+        # Annotate the already logged camera entity.  This is a tiny metadata
+        # event; it deliberately does not manufacture a second full-resolution
+        # image for every camera/tick.
+        for view, is_masked in masked.items():
+            log_rerun_camera_masked(
+                [view],
+                label="MASKED" if is_masked else "VISIBLE",
+                observation_keys=None if observation is None else observation.keys(),
+                display_paths=display_paths,
+            )
+        _VIEW_MASK_LAST_STATUS = status
+
+
+def log_rerun_camera_masked(
+    cam_keys: Iterable[str],
+    label: str = "MASKED",
+    *,
+    observation_keys: Iterable[str] | None = None,
+    display_paths: dict[str, str] | None = None,
+) -> None:
+    """Annotate original camera entities without copying their pixels.
+
+    The annotation is a Rerun ``Boxes2D`` component on the existing camera entity,
+    so the original image remains the only full-resolution payload.  ``TextLog`` is
+    kept as a fallback for older Rerun SDKs that do not expose ``Boxes2D``.
+    """
+    require_package("rerun-sdk", extra="viz", import_name="rerun")
+    import rerun as rr
+
+    keys = set(observation_keys or ())
+    for cam_key in cam_keys:
+        display_key = (display_paths or {}).get(cam_key, cam_key)
+        short_name = display_key.removeprefix("observation.images.").removeprefix("observation.")
+        candidates = (
+            display_key,
+            short_name,
+            f"observation.{short_name}",
+            f"observation.images.{short_name}",
+        )
+        path = next((candidate for candidate in candidates if candidate in keys), display_key)
+        if path == short_name:
+            path = f"observation.{short_name}"
+        if hasattr(rr, "Boxes2D"):
+            color = [220, 0, 0, 255] if label == "MASKED" else [0, 180, 0, 255]
+            rr.log(
+                path,
+                rr.Boxes2D(
+                    mins=[[64, 0]],  # Rerun centres the label on the box; keep it inside the image.
+                    sizes=[[1, 1]],
+                    colors=[color],
+                    labels=[label],
+                    show_labels=True,
+                ),
+                static=True,
+            )
+        else:
+            rr.log(f"view_mask/tile/{short_name}/label", rr.TextLog(label))
 
 
 def log_rerun_saliency(saliency_frames: dict[str, np.ndarray]) -> None:

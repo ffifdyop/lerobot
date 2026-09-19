@@ -319,6 +319,20 @@ def test_reset_episode_boundary(interp2):
     assert interp2.get() is None
 
 
+def test_flush_anchors_next_chunk_at_last_sent_action(interp3):
+    """Discarding a tail must not interpolate from its unsent endpoint."""
+    interp3.add(torch.tensor([0.0]))
+    interp3.get()  # 0.0 reached the robot
+    interp3.add(torch.tensor([9.0]))
+    assert interp3.get().item() == pytest.approx(3.0)
+
+    held = interp3.flush()
+    torch.testing.assert_close(held, torch.tensor([3.0]))
+
+    interp3.add(torch.tensor([6.0]))
+    torch.testing.assert_close(interp3.get(), torch.tensor([4.0]))
+
+
 # ====================== get() on Empty Tests ======================
 
 

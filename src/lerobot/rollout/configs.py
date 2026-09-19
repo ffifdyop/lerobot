@@ -31,6 +31,7 @@ from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device
 
 from .inference import InferenceEngineConfig, SyncInferenceConfig
 from .saliency.config import SaliencyConfig, validate_saliency
+from .view_mask.config import ViewMaskConfig, validate_view_mask
 
 logger = logging.getLogger(__name__)
 
@@ -277,6 +278,9 @@ class RolloutConfig:
     display_compressed_images: bool = False
     # Saliency overlay videos (--saliency.*). See rollout/saliency/config.py.
     saliency: SaliencyConfig = field(default_factory=SaliencyConfig)
+    # View ablation (--view_mask.*): opt-in blacking-out of selected policy views.
+    # See rollout/view_mask/config.py. Disabled by default and inert when disabled.
+    view_mask: ViewMaskConfig = field(default_factory=ViewMaskConfig)
     # Use vocal synthesis to read events
     play_sounds: bool = True
     resume: bool = False
@@ -342,6 +346,11 @@ class RolloutConfig:
         validate_saliency(
             self.saliency, self.inference, self.display_mode, self.display_data, self.use_torch_compile
         )
+
+        # View ablation: reject a half-configured group before any hardware or policy
+        # I/O. Name resolution and hotkey arbitration need the loaded policy/robot and
+        # happen in build_rollout_context instead.
+        validate_view_mask(self.view_mask)
 
         # Sentry MUST use streaming encoding to avoid disk I/O blocking the control loop
         if (

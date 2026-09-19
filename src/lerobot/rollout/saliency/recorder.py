@@ -27,6 +27,7 @@ from lerobot.utils.rerun_visualization import log_rerun_saliency, log_rerun_sali
 
 from .overlay import (
     draw_budget_bar,
+    draw_masked_badge,
     render_overlay,
     render_patch_overlay,
     resize_blur_map,
@@ -39,6 +40,13 @@ logger = logging.getLogger(__name__)
 # Per-chunk decay of the running norm max in "run" scope: at ~1.3 chunks/s a one-off spike
 # (e.g. an FP blowup in one chunk) stops suppressing the scale after ~1 minute.
 _NORM_HI_DECAY = 0.99
+
+
+def _masked_views(view_mask_snapshot) -> frozenset[str]:
+    """Canonical view keys the snapshot blacked out (empty when ablation is off)."""
+    if view_mask_snapshot is None:
+        return frozenset()
+    return frozenset(view_mask_snapshot.masked_views)
 
 
 def _budget_segments(budget: dict[str, float]) -> list[tuple[str, float]]:
@@ -80,6 +88,11 @@ class SaliencyRecorder:
         self._norm_scope = norm_scope
         self._letterbox_hw = letterbox_hw
         self._norm_hi = 0.0  # running max for "run" scope; 0.0 = not yet initialized
+        # View Mask runtime, when view ablation is on.  A snapshot whose revision has
+        # been superseded is filtered out below — as provenance filtering, NOT as a
+        # failure, so it never counts toward the consecutive-failure downgrade.
+        self._view_mask = None
+        self._stale_dropped = 0
         self._queue: queue.Queue = queue.Queue(maxsize=1)
         self._thread: threading.Thread | None = None
         self._writers: dict[str, object] = {}
@@ -90,8 +103,29 @@ class SaliencyRecorder:
         self._closed = False
         os.makedirs(output_dir, exist_ok=True)
 
+    def set_view_mask(self, runtime) -> None:
+        """Bind the View Mask runtime used to drop superseded snapshots.
+
+        A snapshot from an older revision describes the black images of a mask the
+        operator has since changed, so publishing it would attribute old evidence to
+        the new revision.  Dropping it is provenance filtering, not a failure — it
+        must not advance the consecutive-failure guard.
+        """
+        self._view_mask = runtime
+
     def submit(self, snapshot: dict | None) -> None:
         """Non-blocking, drop-oldest push. ``None`` is the shutdown sentinel."""
+        if snapshot is not None and self._view_mask is not None:
+            mask = snapshot.get("view_mask")
+            if mask is not None and not self._view_mask.controller.is_current(mask.revision):
+                self._stale_dropped += 1
+                logger.debug(
+                    "Dropping saliency snapshot for superseded view mask revision %d (current %d; %d dropped)",
+                    mask.revision,
+                    self._view_mask.revision,
+                    self._stale_dropped,
+                )
+                return
         if self._closed and snapshot is not None:
             return  # closed: drop real snapshots; the ``None`` sentinel must still get through
         try:
@@ -132,6 +166,11 @@ class SaliencyRecorder:
                     continue
                 if item is None:
                     break
+                if self._is_stale(item):
+                    # Re-check on the recorder thread too: a transition can land
+                    # between submit() and this pop.
+                    self._stale_dropped += 1
+                    continue
                 try:
                     self._process(item)
                     consecutive_failures = 0
@@ -148,6 +187,15 @@ class SaliencyRecorder:
             # never releases a writer the thread might still be writing to.
             for writer in self._writers.values():
                 writer.release()
+
+    def _is_stale(self, item: dict) -> bool:
+        """Whether a snapshot's View Mask revision has been superseded since it was queued."""
+        if self._view_mask is None:
+            return False
+        mask = item.get("view_mask")
+        if mask is None:
+            return False
+        return not self._view_mask.controller.is_current(mask.revision)
 
     def _process(self, item: dict) -> None:
         maps = self._explainer.compute_saliency(item["preprocessed"], item["noise"], item["chunk_kwargs"])
@@ -198,6 +246,7 @@ class SaliencyRecorder:
             # red by a private per-camera min-max.
             norm_range = shared_norm_range(m for _, _, m in prepared)
         budget_segments = _budget_segments(budget) if budget is not None else None
+        masked_views = _masked_views(item.get("view_mask"))
         rerun_frames: dict[str, np.ndarray] = {}
         for cam_key, frame, display_map in prepared:
             if self._map_kind == "patch":
@@ -210,6 +259,8 @@ class SaliencyRecorder:
                 overlay = render_overlay(
                     frame, display_map, self._alpha, blur_sigma=0.0, norm_range=norm_range
                 )
+            if cam_key in masked_views:
+                overlay = draw_masked_badge(overlay)
             # Some OpenCV builds return a bool from write(), None on others; a False means the
             # frame was silently dropped (e.g. resolution changed mid-video → frozen mp4).
             ret = self._writer(cam_key, overlay.shape[1], overlay.shape[0]).write(overlay)

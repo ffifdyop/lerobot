@@ -136,6 +136,7 @@ class InteractiveSession:
                 "let the policy pick its own subtasks toward a high-level goal",
             ),
             "reset": (self._cmd_reset, "", "stop movement, return to initial position, restore the task"),
+            "mask": (self._cmd_mask, " [view]", "toggle a View Mask camera (or show the current mask)"),
             "stop": (self._cmd_stop, "", "end the session and shut down"),
             "help": (self._cmd_help, "", "show this help"),
         }
@@ -196,6 +197,14 @@ class InteractiveSession:
             self._print(
                 "Reset FAILED — the return move errored, so the robot may NOT be at its "
                 "initial position. Check the robot before /start."
+            )
+        elif event is RolloutEvent.VIEW_MASK_FAILED:
+            runtime = getattr(self.controller, "view_mask", None)
+            reason = getattr(runtime, "failure_reason", None) if runtime is not None else None
+            self._print(
+                f"View mask FAILED — {reason or 'no fresh action arrived in time'}. "
+                "The policy is NOT driving the robot. /reset to restore the launch mask, "
+                "or /stop to shut down."
             )
         elif event is RolloutEvent.ENGINE_FAILED:
             self._report_failure("Inference engine failed — shutting down.")
@@ -294,6 +303,10 @@ class InteractiveSession:
         elif result is AskResult.BUSY:
             # Could be a previous /vqa or an autosteer query — the channel does not say which.
             self._print("The policy is busy with another query — try again in a moment.")
+        elif result is AskResult.MASK_APPLYING:
+            self._print("View mask transition in flight — try again once it is ACTIVE.")
+        elif result is AskResult.MASK_FAILED:
+            self._print("View mask FAILED — /reset before asking the policy anything.")
         else:  # a future AskResult variant must not be mislabeled as busy
             logger.error("Unhandled AskResult %r for /vqa", result)
             self._print(f"Could not queue the question ({result.value}).")
@@ -324,6 +337,10 @@ class InteractiveSession:
                 f"Autosteer on — goal {goal!r}. The policy picks its own subtasks; "
                 "each one is announced here. Take over with /subtask <text> or /autosteer off."
             )
+        elif result is AskResult.MASK_APPLYING:
+            self._print("View mask transition in flight — autosteer starts once it is ACTIVE.")
+        elif result is AskResult.MASK_FAILED:
+            self._print("View mask FAILED — /reset before starting autosteer.")
         else:  # a future AskResult variant must not be announced as success
             logger.error("Unhandled AskResult %r for /autosteer", result)
             self._print(f"Could not start autosteer ({result.value}).")
@@ -333,6 +350,34 @@ class InteractiveSession:
             self._print(f"Task restored to {_format_task(self.controller.initial_task)}")
         elif self.controller.stopped:
             self._print("Can't reset — the session has stopped.")
+
+    def _cmd_mask(self, cmd: InteractiveCommand) -> None:
+        """Toggle a camera without competing with the line-oriented stdin reader."""
+        runtime = self.controller.view_mask
+        if runtime is None:
+            self._print("View Mask is disabled for this rollout.")
+            return
+        if not cmd.args:
+            snapshot = runtime.current
+            self._print(
+                f"View Mask revision {snapshot.revision} ({runtime.controller.state.value}): "
+                f"{sorted(snapshot.masked_views) or ['(none)']}"
+            )
+            return
+
+        name = _strip_quotes(cmd.args.strip())
+        candidates = {
+            view
+            for view in runtime.plan.canonical_views
+            if name == view or name == view.removeprefix("observation.images.")
+        }
+        if len(candidates) != 1:
+            available = ", ".join(runtime.plan.canonical_views)
+            self._print(f"Unknown or ambiguous view {name!r}. Available canonical views: {available}")
+            return
+        view = next(iter(candidates))
+        runtime.controller.toggle(view)
+        self._print(f"Queued View Mask toggle for {view}; it will apply on the next control tick.")
 
     def _cmd_stop(self, cmd: InteractiveCommand) -> None:
         self.controller.stop()

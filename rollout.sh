@@ -94,6 +94,8 @@ lerobot-rollout \
   --saliency.method=attention \
   --saliency.video_fps=1 \
   --display_data=true --display_mode=rerun \
+  --view_mask.enabled=true \
+  --view_mask.initial_views='["top"]' \
 
   # --- saliency 叠加热力图（上面四行已启用）---
   # 前提：第 5 行 CUDA_VISIBLE_DEVICES 是多卡掩码（explainer 副本跑第二张卡）。

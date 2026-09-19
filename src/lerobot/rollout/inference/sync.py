@@ -28,6 +28,7 @@ from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
 
+from ..view_mask.inference import ViewMaskInferenceMixin, stamp_view_mask
 from .base import InferenceEngine, PolicyQuery
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,7 @@ logger = logging.getLogger(__name__)
 # side effect of ``select_action``).
 
 
-class SyncInferenceEngine(InferenceEngine):
+class SyncInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
     """Inline synchronous inference: compute one action per call.
 
     ``get_action`` runs the full policy pipeline (pre/post-processor +
@@ -112,6 +113,9 @@ class SyncInferenceEngine(InferenceEngine):
             else nullcontext()
         )
         task, task_changed = self._take_task()
+        # Captured before the policy call: a mask change landing mid-inference must
+        # not relabel this action, and its result must be discarded below.
+        mask = self._view_mask.snapshot() if self._view_mask is not None else None
         with torch.inference_mode(), autocast_ctx:
             if task_changed:
                 # Chunking policies queue actions computed under the previous instruction,
@@ -120,10 +124,23 @@ class SyncInferenceEngine(InferenceEngine):
                 logger.info("Task changed to '%s' — dropping precomputed actions", task)
                 self._policy.drop_queued_actions()
             observation = prepare_observation_for_inference(observation, self._device, task, self._robot_type)
+            if mask is not None:
+                observation = stamp_view_mask(observation, mask)
             observation = self._preprocessor(observation)
             action = self._policy.select_action(observation)
             action = self._postprocessor(action)
         action_tensor = action.squeeze(0).cpu()
+
+        if mask is not None and not self._view_mask.is_executable(mask.revision):
+            # The mask changed while the policy was running (or the mask latched
+            # FAILED): this action describes a scene the operator has moved on from.
+            # Dropping it happens before the interpolator or the robot ever see it.
+            logger.info(
+                "Discarding action computed under stale view mask revision %d (current %d)",
+                mask.revision,
+                self._view_mask.revision,
+            )
+            return None
 
         # Reorder to match dataset action ordering so the caller can treat
         # the returned tensor uniformly across backends.
@@ -131,7 +148,25 @@ class SyncInferenceEngine(InferenceEngine):
         # ``task`` is the pre-inference snapshot: a /subtask landing mid-inference must
         # not relabel this action.
         self._set_dispatched_task(task)
+        if mask is not None:
+            self._view_mask.set_dispatched(mask)
+            # First executable action for the newest revision: the transition is done.
+            self._view_mask.mark_active(mask)
         return torch.tensor([action_dict[k] for k in self._ordered_action_keys])
+
+    def reset_for_mask_transition(self) -> None:
+        """View Mask Inference Flush.
+
+        Sync has no queue to drain — it recomputes from the observation every tick —
+        but chunking policies keep an internal action queue from ``select_action``,
+        and the processors may carry history (Diffusion-family observation queues).
+        Clearing the same state ``reset`` clears, minus the task edge, is what makes
+        the next returned action fresh for the new mask.
+        """
+        logger.info("Sync inference: flushing policy and processors for the new view mask")
+        self._policy.reset()
+        self._preprocessor.reset()
+        self._postprocessor.reset()
 
     # ------------------------------------------------------------------
     # Text queries
@@ -157,8 +192,13 @@ class SyncInferenceEngine(InferenceEngine):
         )
         # Live task, read without consuming the task-changed edge (the action path needs it).
         task = self.task
+        # Text queries share the action path's mask: asking the policy a question about a
+        # blacked-out view must show it the same black view the actions were based on.
+        mask = self._view_mask.snapshot() if self._view_mask is not None else None
         with torch.inference_mode(), autocast_ctx:
             observation = prepare_observation_for_inference(obs_frame, self._device, task, self._robot_type)
+            if mask is not None:
+                observation = stamp_view_mask(observation, mask)
             observation = self._mark_query(observation, query)
             # Reusing the action path's preprocessor is safe only while its steps are
             # stateless per call; the one that is not (an enabled RelativeActionsProcessorStep)

@@ -145,6 +145,17 @@ Usage examples
         --dataset.single_task="patrol" \\
         --resume=true
 
+    # View ablation — black out a view for the policy while the dataset and the
+    # operator keep the original pixels. F1/F2/F3 toggle views at runtime.
+    lerobot-rollout \\
+        --strategy.type=base \\
+        --policy.path=user/my_policy \\
+        --robot.type=bi_openarm_follower \\
+        --robot.port=/dev/ttyACM0 \\
+        --task="fold the shirt" \\
+        --view_mask.enabled=true \\
+        --view_mask.initial_views='["left_wrist"]'
+
     # Rollout with custom video encoding parameters
     lerobot-rollout \\
         --strategy.type=base \\
@@ -241,6 +252,12 @@ def rollout(cfg: RolloutConfig):
     ctx = build_rollout_context(cfg, shutdown_event)
 
     strategy = create_strategy(cfg.strategy)
+    if ctx.policy.view_mask is not None:
+        # Attach the saliency recorder to the View Mask timeline so superseded
+        # revisions are filtered as provenance, not counted as failures.
+        if ctx.policy.saliency is not None:
+            ctx.policy.saliency.set_view_mask(ctx.policy.view_mask)
+        ctx.policy.view_mask.start()
     logger.info("Rollout strategy: %s", cfg.strategy.type)
     logger.info(
         "Robot: %s | FPS: %.0f | Duration: %s",
@@ -260,6 +277,11 @@ def rollout(cfg: RolloutConfig):
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     finally:
+        # The hotkey listener and the event sidecar stop before the hardware teardown:
+        # a keypress during a several-second return move would otherwise queue a
+        # transition nobody is left to honour.
+        if ctx.policy.view_mask is not None:
+            ctx.policy.view_mask.stop()
         strategy.teardown(ctx)
         if ctx.policy.saliency is not None:
             logger.info("Finalizing saliency overlay videos...")

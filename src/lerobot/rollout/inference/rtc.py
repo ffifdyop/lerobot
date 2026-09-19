@@ -45,6 +45,7 @@ from lerobot.processor import (
 from lerobot.utils.feature_utils import build_dataset_frame
 
 from ..robot_wrapper import ThreadSafeRobot
+from ..view_mask.inference import ViewMaskInferenceMixin, stamp_view_mask
 from .base import InferenceEngine, PolicyQuery
 
 logger = logging.getLogger(__name__)
@@ -190,9 +191,18 @@ def _build_saliency_snapshot(
     noise: torch.Tensor | None,
     inference_delay: int,
     prev_chunk_left_over: torch.Tensor | None,
+    view_mask=None,
 ) -> dict:
-    """Copy of everything the saliency explainer needs to replay one chunk exactly."""
-    return {
+    """Copy of everything the saliency explainer needs to replay one chunk exactly.
+
+    Captured *after* the View Mask processor, so the explainer replays the black
+    images the policy actually consumed; ``view_mask`` lets the recorder drop a
+    snapshot whose revision has since been superseded.
+
+    The mask entry is added only when a mask is in play, so an ablation-free rollout
+    produces exactly the snapshot it did before the capability existed.
+    """
+    snapshot = {
         "preprocessed": {
             k: (v.detach().clone() if isinstance(v, torch.Tensor) else v) for k, v in preprocessed.items()
         },
@@ -204,6 +214,9 @@ def _build_saliency_snapshot(
             else prev_chunk_left_over.detach().clone(),
         },
     }
+    if view_mask is not None:
+        snapshot["view_mask"] = view_mask
+    return snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +224,7 @@ def _build_saliency_snapshot(
 # ---------------------------------------------------------------------------
 
 
-class RTCInferenceEngine(InferenceEngine):
+class RTCInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
     """Async RTC inference: a background thread produces action chunks.
 
     ``get_action`` pops the next action from the shared queue (or
@@ -262,6 +275,10 @@ class RTCInferenceEngine(InferenceEngine):
         # Bumped by reset() under _obs_lock, so a chunk whose inference started before a
         # reset is discarded instead of merged into the fresh queue.
         self._reset_epoch = 0
+        # Mask transitions can be requested by the control thread while this worker is
+        # inside policy inference.  The worker consumes this flag between calls, so
+        # policy/processor state is never reset concurrently with its owner thread.
+        self._mask_reset_pending = False
         self._policy_active = Event()
         self._compile_warmup_done = Event()
         self._shutdown_event = Event()
@@ -391,9 +408,34 @@ class RTCInferenceEngine(InferenceEngine):
             if self._action_queue is not None:
                 self._action_queue.clear()
             self._obs_holder["obs"] = None
+            self._obs_holder["mask"] = None
             self._reset_epoch += 1
         # The queue is empty, so a pending task change has nothing stale to blend against.
         self._discard_task_change()
+
+    def reset_for_mask_transition(self) -> None:
+        """View Mask Inference Flush for the async backend.
+
+        Same clear-and-bump as :meth:`reset` — the epoch guard is what discards a
+        chunk whose inference is still in flight — but the task is preserved: a mask
+        change re-conditions the same instruction, it does not re-instruct.
+
+        The RTC thread is deliberately *not* waited on.  It may be seconds into a
+        remote request that cannot be cancelled; the epoch bump plus the queue's
+        revision labels make its eventual result a no-op instead.
+        """
+        logger.info("RTC inference: flushing queue for the new view mask")
+        with self._obs_lock:
+            if self._action_queue is not None:
+                self._action_queue.clear()
+            # Keep the observation — the robot is still where it was and the next
+            # chunk should be re-planned from the current state under the new mask.
+            # Re-stamp the holder immediately; the epoch bump discards any in-flight
+            # chunk regardless of when the worker next observes this request.
+            if self._view_mask is not None:
+                self._obs_holder["mask"] = self._view_mask.controller.snapshot()
+            self._reset_epoch += 1
+            self._mask_reset_pending = True
 
     # ------------------------------------------------------------------
     # Action production (called from main thread)
@@ -403,23 +445,47 @@ class RTCInferenceEngine(InferenceEngine):
         """Pop the next action from the RTC queue (ignores ``obs_frame``)."""
         if self._action_queue is None:
             return None
-        queued = self._action_queue.get_with_task()
+        queued = self._action_queue.get_with_provenance()
         if queued is None:
             return None
-        # The queue pairs each action with its chunk's task under the queue lock, so a
-        # concurrent merge cannot cross labels between chunks.
-        action, task = queued
+        # The queue pairs each action with its chunk's task and mask revision under
+        # the queue lock, so a concurrent merge cannot cross labels between chunks.
+        action, task, mask_revision = queued
         if task is None:
             # Every merge here labels its chunk, so a missing label means a foreign
             # writer: fail loudly rather than corrupt dispatched_task and frame labels.
             raise RuntimeError("RTC action queue returned an action without task provenance")
+        if self._view_mask is not None:
+            if mask_revision is None:
+                # With View Mask attached, an unlabelled chunk cannot be proven to
+                # match the current visual condition.  Treat it like missing task
+                # provenance instead of silently executing it.
+                raise RuntimeError("RTC action queue returned an action without view-mask provenance")
+            if not self._view_mask.is_current(mask_revision):
+                # A chunk merged before the transition is still sitting in the queue:
+                # it was generated from a scene the operator has since changed.
+                logger.info(
+                    "Dropping queued RTC action from stale view mask revision %d (current %d)",
+                    mask_revision,
+                    self._view_mask.revision,
+                )
+                return None
+            snapshot = self._view_mask.controller.snapshot()
+            self._view_mask.set_dispatched(snapshot)
+            # An action generated under the newest revision can now run: ACTIVE.
+            self._view_mask.mark_active(snapshot)
         self._set_dispatched_task(task)
         return action
 
     def notify_observation(self, obs: dict) -> None:
-        """Publish the latest observation for the RTC thread to consume."""
+        """Publish the latest observation (and its mask snapshot) for the RTC thread."""
         with self._obs_lock:
             self._obs_holder["obs"] = obs
+            # Captured under the same lock as the observation so the RTC thread can
+            # never pair one tick's pixels with another tick's mask.
+            self._obs_holder["mask"] = (
+                None if self._view_mask is None else self._view_mask.controller.snapshot()
+            )
 
     # ------------------------------------------------------------------
     # Text queries
@@ -444,6 +510,9 @@ class RTCInferenceEngine(InferenceEngine):
         obs_batch = prepare_observation_for_inference(
             obs_batch, torch.device(self._device), task, self._robot.robot_type
         )
+        mask = self._view_mask.snapshot() if self._view_mask is not None else None
+        if mask is not None:
+            obs_batch = stamp_view_mask(obs_batch, mask)
         obs_batch = self._mark_query(obs_batch, query)
         preprocessed = self._preprocessor(obs_batch)
         with torch.inference_mode():
@@ -471,10 +540,31 @@ class RTCInferenceEngine(InferenceEngine):
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
 
-                queue = self._action_queue
+                # Policy and processor objects belong to this worker.  Consume a pending
+                # transition and capture the observation in one critical section.  This
+                # prevents a worker from deciding that no reset is needed, then reading
+                # a post-transition observation before the reset has run.
                 with self._obs_lock:
-                    obs = self._obs_holder.get("obs")
-                    epoch_before = self._reset_epoch
+                    queue = self._action_queue
+                    if self._mask_reset_pending:
+                        self._mask_reset_pending = False
+                        mask_reset_pending = True
+                        obs = None
+                        mask = None
+                        epoch_before = self._reset_epoch
+                    else:
+                        mask_reset_pending = False
+                        obs = self._obs_holder.get("obs")
+                        # Read alongside the observation: the mask used for this chunk
+                        # must be the one that belongs to these pixels.
+                        mask = self._obs_holder.get("mask")
+                        epoch_before = self._reset_epoch
+                if mask_reset_pending:
+                    self._policy.reset()
+                    self._preprocessor.reset()
+                    self._postprocessor.reset()
+                    self._discard_task_change()
+                    continue
                 if queue is None or obs is None:
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
@@ -484,13 +574,37 @@ class RTCInferenceEngine(InferenceEngine):
                 # for it to drain.  A next-subtask answer is applied via ``set_task``, so the chunk path
                 # below uses it, and that path re-runs the preprocessor on its own observation, so
                 # stateful steps (relative-action anchoring) are not left holding this query's.
-                if self._service_query(obs):
+                query_revision = None if mask is None else mask.revision
+                result_guard = (
+                    None
+                    if query_revision is None
+                    else lambda revision=query_revision: (
+                        self._view_mask is not None
+                        and not self._view_mask.blocked
+                        and self._view_mask.is_current(revision)
+                    )
+                )
+                if self._service_query(obs, result_guard=result_guard):
                     # The generation took seconds, so the snapshot above is stale: re-read
-                    # the observation, and the epoch so the discard guard below also covers
-                    # a reset that landed during the query.
+                    # the observation, the mask and the epoch.  A transition may also
+                    # have requested the deferred policy reset during the query; consume
+                    # it before starting action inference for the new revision.
                     with self._obs_lock:
-                        obs = self._obs_holder.get("obs")
-                        epoch_before = self._reset_epoch
+                        if self._mask_reset_pending:
+                            self._mask_reset_pending = False
+                            mask_reset_pending = True
+                            obs = None
+                        else:
+                            mask_reset_pending = False
+                            obs = self._obs_holder.get("obs")
+                            mask = self._obs_holder.get("mask")
+                            epoch_before = self._reset_epoch
+                    if mask_reset_pending:
+                        self._policy.reset()
+                        self._preprocessor.reset()
+                        self._postprocessor.reset()
+                        self._discard_task_change()
+                        continue
                     if obs is None:  # a reset mid-query dropped the observation
                         continue
 
@@ -532,6 +646,8 @@ class RTCInferenceEngine(InferenceEngine):
                             obs_batch, policy_device, task, self._robot.robot_type
                         )
                         obs_batch["task"] = [task]
+                        if mask is not None:
+                            obs_batch = stamp_view_mask(obs_batch, mask)
 
                         preprocessed = self._preprocessor(obs_batch)
 
@@ -576,6 +692,7 @@ class RTCInferenceEngine(InferenceEngine):
                                             noise=noise,
                                             inference_delay=delay,
                                             prev_chunk_left_over=prev_actions,
+                                            view_mask=mask,
                                         )
                                     )
                             except Exception:
@@ -650,10 +767,29 @@ class RTCInferenceEngine(InferenceEngine):
                             # clear-and-bump, so a reset cannot land between them and leak
                             # a pre-reset chunk.  Lock order: _obs_lock -> queue.lock.
                             epoch_unchanged = epoch_before == self._reset_epoch
-                            if epoch_unchanged:
-                                queue.merge(original, processed, new_delay, idx_before, task=task)
+                            # A mask transition is also a merge guard: a chunk produced
+                            # under the old revision must never join the fresh queue.
+                            mask_still_current = (
+                                mask is None
+                                or self._view_mask is None
+                                or self._view_mask.is_current(mask.revision)
+                            )
+                            if epoch_unchanged and mask_still_current:
+                                queue.merge(
+                                    original,
+                                    processed,
+                                    new_delay,
+                                    idx_before,
+                                    task=task,
+                                    mask_revision=None if mask is None else mask.revision,
+                                )
                         if not epoch_unchanged:
                             logger.info("Discarding action chunk computed before an engine reset")
+                        elif not mask_still_current:
+                            logger.info(
+                                "Discarding action chunk computed under stale view mask revision %d",
+                                mask.revision,
+                            )
 
                         if (
                             is_warmup

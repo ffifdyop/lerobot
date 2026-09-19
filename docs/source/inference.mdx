@@ -263,6 +263,7 @@ lerobot-rollout \
 | `/subtask <text>`   | Change the instruction the policy follows, without stopping. No argument prints the current task. Only affects policies that condition on language (SmolVLA, π0/π0.5, and similar) |
 | `/vqa <text>`       | Ask the policy a question about what it currently sees. Only while a run is in progress, and only for policies with a text head                                                    |
 | `/autosteer <goal>` | Hand the policy a high-level goal and let it choose its own subtasks. `/autosteer off` hands control back; no argument reports the current goal                                    |
+| `/mask [view]`      | Show the current View Mask, or queue a toggle for a canonical/bare camera view                                                   |
 | `/reset`            | Stop movement, return the robot to its startup position, and restore the `--task` instruction                                                                                      |
 | `/stop`             | End the session and run the normal shutdown routines                                                                                                                               |
 | `/help`             | List the commands                                                                                                                                                                  |
@@ -300,6 +301,11 @@ With `--use_torch_compile=true`, an instruction that tokenizes to a different le
 **`/vqa`** answers from the next observation and prints when ready, so you can keep typing meanwhile; only one question is in flight at a time (autosteer's own queries share that slot). Text generation is far slower than a control tick, so the robot drains its queued actions and then holds position until the answer lands, and that time counts against `--duration`. Questions are only accepted while a run is in progress — an idle engine has no current view — and one still unanswered when a segment ends is dropped and reported.
 
 **`/autosteer`** hands the policy a goal and asks it for the next subtask every `--autosteer_interval_s` seconds (default 10), applying each one through the same path as `/subtask` and announcing it in the chat. Every query is a full text generation, so the interval is a cost knob: lower values re-plan sooner but spend more of the loop generating text instead of acting. Plan progress lives in the policy, not the rollout, so the plan dies with the segment; the sequencer also stops on `/reset`, `/subtask`, `/autosteer off`, and the first planning failure.
+
+When interactive mode is running on a terminal backend without global keyboard capture (for example
+Wayland/headless SSH), use `/mask <view>` instead of function-key hotkeys. This avoids competing
+with the line-oriented command reader; desktop sessions with a trusted global keyboard backend keep
+the F-key controls.
 
 **Logs below ERROR are muted while the session runs** so routine output doesn't interleave with what you're typing; errors and fatal inference failures still show, and normal logging resumes when the session ends. The [cadence summaries](#cadence-reporting) are printed in the chat instead, and running without `--interactive` gets you the live log back.
 
@@ -376,6 +382,167 @@ strategy.teardown(ctx)  # teardown stays with the caller
 | `--use_torch_compile`             | Enable `torch.compile` for inference                              | false   |
 | `--resume`                        | Resume a previous recording session                               | false   |
 | `--play_sounds`                   | Vocal synthesis for events                                        | true    |
+| `--view_mask.enabled`             | Opt in to View Ablation (see below)                               | false   |
+| `--view_mask.initial_views`       | Views masked at launch, by raw or canonical key                   | `[]`    |
+| `--view_mask.hotkeys`             | Per-view toggle keys; empty = `F1`, `F2`, `F3`…                    | `{}`    |
+| `--view_mask.transition_timeout_s` | Runnable inference allowed before a transition latches `FAILED`  | 10.0    |
+| `--view_mask.event_log_path`      | Override the JSONL sidecar path                                   | auto    |
+
+---
+
+## View Ablation (`--view_mask.*`)
+
+View ablation masks selected camera views **for the policy only**, so you can measure how much of
+a policy's behaviour depends on each view. The camera keeps capturing, the dataset keeps the
+original pixels, and the human operator keeps watching the real scene — only the policy's input
+changes. The standard controls described below use a full-frame black mask.
+
+```bash
+lerobot-rollout \
+    --strategy.type=base \
+    --policy.path=user/my_policy \
+    --robot.type=bi_openarm_follower \
+    --robot.cameras="{ top: {...}, left_wrist: {...}, right_wrist: {...} }" \
+    --task="fold the shirt" \
+    --view_mask.enabled=true \
+    --view_mask.initial_views='["left_wrist"]'
+```
+
+### The standard controls use a full-frame black mask
+
+The CLI, function-key controls and `/mask` command replace every pixel of a selected view with
+zeros of the same shape, dtype and device. The camera key, the slot order and every other view
+stay exactly as they were. This is a pixel transformation, not a missing-view protocol.
+
+Internally, the standard controls select `FullFrameViewMask`, one implementation of the
+`ViewMaskOperator` extension interface carried by each revision snapshot.
+
+This matters for two reasons:
+
+- Policies with a fixed visual schema (ACT, Diffusion, VQBeT, DM05 remote inference, …) require
+  every camera key. Deleting a key would crash them, and some VLAs would silently left-shift the
+  remaining views into the wrong slots.
+- The model still receives an image *token* for the masked view. It is not a logical
+  missing-view protocol: attention and gradients can legitimately be non-zero on a black frame.
+  Saliency output therefore keeps the model's real values and simply labels the view `MASKED` —
+  it is never zeroed or hidden.
+
+### Custom spatial masks (programmatic extension)
+
+An integration that constructs `ViewMaskController` directly may supply an immutable
+`operator_factory` to mask a different spatial region. The operator declares which canonical
+views it affects, returns a derived observation without mutating the caller's mapping or tensors,
+and returns a JSON-serializable description from `to_metadata()`. The same processor, Sync/RTC
+revision checks, VQA and saliency paths then apply without special cases.
+
+```python
+controller = ViewMaskController(
+    plan,
+    timeout_s=10.0,
+    operator_factory=MySpatialViewMask,  # Your immutable ViewMaskOperator implementation.
+)
+```
+
+`lerobot-rollout` does not currently expose rectangle, circle, polygon or bitmap geometry through
+`--view_mask.*`; its standard builder uses `FullFrameViewMask`. Those shapes can be added as new
+operators without changing the inference boundary. The per-frame `view_mask` vector only says
+which views contain masked pixels; the sidecar records the operator metadata for the revision.
+
+### Hotkeys
+
+| Key  | Effect                                            |
+| ---- | ------------------------------------------------- |
+| `F1` | Toggle the 1st canonical view in the mask         |
+| `F2` | Toggle the 2nd canonical view                     |
+| `F3` | Toggle the 3rd canonical view                     |
+
+Defaults bind `F1`, `F2`, `F3`… to the policy's visual features **in the policy's own
+declaration order** (that order is the model's slot identity and is never re-sorted). One press
+adds a view, the next removes it; holding a key down does not toggle repeatedly.
+
+```bash
+# Remap a specific view; unlisted views keep their default key.
+--view_mask.hotkeys='{"observation.images.left_wrist": "f6"}'
+```
+
+A hotkey that clashes with another rollout control (`DAgger`'s space/tab, Highlight's save key,
+a teleop key) fails at startup and names both sides — registration order never decides who wins.
+
+### Views by name
+
+`--view_mask.initial_views` accepts either the robot's raw camera key (`left_wrist`) or the
+policy's canonical key (`observation.images.left_wrist`); `--rename_map` is applied first.
+Internally, in the logs, in the display and in every recorded field, only canonical keys appear.
+An unknown, non-visual or **ambiguous** name rejects the whole configuration rather than
+applying the legal subset — a half-applied mask would ablate the wrong view with no visible
+symptom.
+
+### The transition, and what you will see
+
+Changing the mask is atomic. On each switch the system:
+
+1. Bumps the revision and enters `APPLYING`.
+2. Flushes the policy, both processors, the action queue and the interpolated tail — but keeps
+   the task, which the mask only re-conditions.
+3. Holds the last action the robot actually received. It never keeps executing queued or
+   interpolated chunks planned for the old mask.
+4. Enters `ACTIVE` the moment a fresh action for the new revision arrives.
+
+`APPLYING` normally lasts one inference. If no fresh action arrives within
+`--view_mask.transition_timeout_s` (default **10 s**) *of runnable inference*, the state latches
+`FAILED`. Time spent idle, paused, or under human control does not count, so pre-setting a mask
+before `/start` cannot cause a false failure.
+
+| State      | Policy dispatches | Training frames | `/vqa` and `/autosteer`                  |
+| ---------- | ----------------- | --------------- | ---------------------------------------- |
+| `ACTIVE`   | yes               | yes             | yes                                      |
+| `APPLYING` | no (holds)        | no              | refused until `ACTIVE`                   |
+| `FAILED`   | no (latched)      | no              | refused until `/reset` or a restart      |
+
+A `FAILED` mask never auto-rolls-back, never restores an old queue and never retries. In a
+non-interactive rollout it ends the run; in an interactive session it keeps the session alive so
+you can `/reset` (which restores the launch mask at a **new** revision — the revision never
+returns to 0, so results from the old mask stay recognisably stale). Under DAgger the operator
+keeps control either way: a `FAILED` mask suspends policy dispatch, it does not take the robot.
+
+In Rerun, each masked camera tile keeps its original picture and gains a red `MASKED` marker,
+with per-view 0/1, revision and state on the `view_mask` timeline. Foxglove receives the
+expressible equivalent. The display is a monitor, never a control surface: `--display_data=false`
+leaves hotkeys, inference and recording untouched.
+
+### Output
+
+With a dataset, the run adds two per-frame fields and one sidecar file:
+
+| Output                              | Contents                                                                 |
+| ----------------------------------- | ------------------------------------------------------------------------ |
+| `view_mask` (bool, shape `(N,)`)    | Per-view mask, `names` = canonical view keys in policy order              |
+| `view_mask_revision` (int64)        | Revision the recorded action was generated under                          |
+| `<dataset.root>/meta/view_mask_events.jsonl` | Launch, every transition, state change and failure             |
+
+Without a dataset (Base strategy) the sidecar goes to
+`outputs/rollout/<timestamp>/view_mask_events.jsonl`; `--view_mask.event_log_path` overrides
+either default.
+
+Each JSONL line carries run-relative monotonic time, revision, old/new mask, source and state,
+plus the control phase (`DAgger`) and the dataset episode / nearest frame index when available —
+so a switch that landed *between* frames can be aligned to the timeline instead of being faked as
+a frame. The `run_started` event stores `initial_mask_operator`; transition events store both
+`mask_operator` and `old_mask_operator`. These objects come from the operator's `to_metadata()`
+method and describe details such as mask type, affected views and spatial bounds when provided.
+
+A Policy frame records the mask its **dispatched action** was generated under, never the
+controller's live value: under RTC the action being recorded may have been produced a chunk ago,
+and the mask may already have moved on. A Human frame (DAgger) records the live snapshot — the
+condition the shadow policy saw — and `intervention` still records who produced the action.
+
+> **Enabling it changes the dataset schema.** `view_mask` and `view_mask_revision` are added at
+> creation time and are not added when the capability is off. `--resume` onto a dataset whose
+> mask fields are missing, differently shaped or differently named fails fast; start a new
+> dataset instead. Migration is deliberately not attempted.
+
+Everything above is off by default: without `--view_mask.enabled=true` no hotkeys are registered,
+no processor step is injected and no dataset field is added.
 
 ---
 

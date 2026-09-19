@@ -177,6 +177,35 @@ def apply_recording_control(control: str, events: dict) -> None:
 # an unknown final byte yields None (sequence ignored).
 _ARROW_FINAL_BYTES = {"A": "up", "B": "down", "C": "right", "D": "left"}
 
+# Function keys also come in the two encodings, and F1..F4 additionally reuse the
+# arrow final bytes in SS3 form. The CSI form (``ESC [ <code> ~``) is the common one.
+_FUNCTION_SS3_FINAL = {"P": "f1", "Q": "f2", "R": "f3", "S": "f4"}
+# xterm's CSI ``n~`` function-key codes are non-contiguous after F5.  Include the
+# extended range because the default View Mask bindings are defined for every
+# policy-declared visual slot, not only the first eight cameras.
+_FUNCTION_CSI_CODES = {
+    11: "f1",
+    12: "f2",
+    13: "f3",
+    14: "f4",
+    15: "f5",
+    17: "f6",
+    18: "f7",
+    19: "f8",
+    20: "f9",
+    21: "f10",
+    23: "f11",
+    24: "f12",
+    25: "f13",
+    26: "f14",
+    28: "f15",
+    29: "f16",
+    31: "f17",
+    32: "f18",
+    33: "f19",
+    34: "f20",
+}
+
 
 class TerminalKeyListener:
     """Display-independent keyboard listener that reads keys from the controlling TTY.
@@ -225,14 +254,17 @@ class TerminalKeyListener:
     def _parse(self, ch: str) -> str | None:
         """Decode one (possibly multi-byte) key starting at ``ch`` into a key name."""
         if ch == "\x1b":
-            # Possible CSI / SS3 escape sequence (arrow keys) or a bare ESC. Use
-            # short follow-up reads so a lone ESC is not mistaken for a sequence.
+            # Possible CSI / SS3 escape sequence (arrow or function keys) or a bare
+            # ESC. Use short follow-up reads so a lone ESC is not mistaken for one.
             ch2 = self._read_char(timeout=0.02)
             if ch2 is None:
                 return "esc"
-            if ch2 in ("[", "O"):
-                ch3 = self._read_char(timeout=0.02)
-                return _ARROW_FINAL_BYTES.get(ch3 or "")
+            if ch2 == "O":
+                # SS3: arrows share their final byte with F1–F4.
+                ch3 = self._read_char(timeout=0.02) or ""
+                return _ARROW_FINAL_BYTES.get(ch3) or _FUNCTION_SS3_FINAL.get(ch3)
+            if ch2 == "[":
+                return self._parse_csi()
             # Some other escape sequence (e.g. Alt+key); ignore it.
             return None
         if ch in ("\r", "\n"):
@@ -245,6 +277,33 @@ class TerminalKeyListener:
             return "backspace"
         if ch.isprintable():
             return ch
+        return None
+
+    def _parse_csi(self) -> str | None:
+        """Decode the body of a CSI sequence after ``ESC [``.
+
+        Handles the forms this module emits: a bare final byte (arrows, Home/End)
+        and a numeric parameter terminated by ``~`` (function keys).  Anything
+        longer or unknown is consumed and ignored rather than leaking into the
+        key stream as stray characters.
+        """
+        buf = ""
+        while len(buf) < 8:
+            ch = self._read_char(timeout=0.02)
+            if ch is None:
+                return None
+            if ch.isdigit() or ch == ";":
+                buf += ch
+                continue
+            if ch == "~":
+                try:
+                    code = int(buf.split(";")[-1])
+                except ValueError:
+                    return None
+                return _FUNCTION_CSI_CODES.get(code)
+            if not buf:
+                return _ARROW_FINAL_BYTES.get(ch)
+            return None
         return None
 
     def _run(self) -> None:
@@ -321,6 +380,12 @@ if keyboard is not None:
         keyboard.Key.space: "space",
         keyboard.Key.backspace: "backspace",
     }
+    # Function keys: the default View Mask hotkeys (F1, F2, F3…).  Added here rather
+    # than in a view-ablation-only map so both backends spell them identically.
+    for _index in range(1, 21):
+        _fn_key = getattr(keyboard.Key, f"f{_index}", None)
+        if _fn_key is not None:
+            _PYNPUT_KEY_NAMES[_fn_key] = f"f{_index}"
 else:
     _PYNPUT_KEY_NAMES = {}
 
@@ -390,6 +455,141 @@ def create_key_listener(dispatch: Callable[[str], None], *, controls_help: str =
         "not an interactive terminal%s.",
         suffix,
     )
+    return None
+
+
+class LatchingKeyListener:
+    """Wraps a key listener so a *held* key produces exactly one dispatch.
+
+    Discrete controls want every key-down; latch-style controls (the View Mask
+    hotkeys) want one event per independent press.  This filters the auto-repeat
+    that ``pynput`` emits while a key is held, using the key-release events pynput
+    provides — so F1 held down toggles its view once, and only a genuine second
+    press toggles it back.
+
+    Backends without key-release events (the terminal fallback) use a conservative
+    repeat window.  Terminal input cannot represent key-up, so a second independent
+    press must be separated from the first by that window; this is preferable to
+    allowing the OS auto-repeat stream to toggle the mask continuously.
+    """
+
+    def __init__(
+        self,
+        dispatch: Callable[[str], None],
+        releases_available: bool,
+        terminal_repeat_window_s: float = 0.75,
+    ) -> None:
+        self._dispatch = dispatch
+        self._releases_available = releases_available
+        self._latched: set[str] = set()
+        self._released: set[str] | None = set() if releases_available else None
+        self._last_terminal_press: dict[str, float] = {}
+        self._terminal_repeat_window_s = terminal_repeat_window_s
+        self._lock = threading.Lock()
+
+    def on_press(self, key) -> None:
+        """Deliver a key-down exactly once per latch cycle."""
+        name = key if isinstance(key, str) else _resolve_pynput_key(key)
+        if name is None:
+            return
+        with self._lock:
+            if self._releases_available:
+                if name in self._latched:
+                    return  # auto-repeat while held
+            else:
+                now = time.monotonic()
+                previous = self._last_terminal_press.get(name)
+                # Refresh on suppressed repeats too.  Terminal input has no key-up
+                # event, so continuous auto-repeat must remain one latch cycle even
+                # when the hold lasts longer than the debounce window.
+                self._last_terminal_press[name] = now
+                if previous is not None and now - previous < self._terminal_repeat_window_s:
+                    return  # terminal auto-repeat while the key is held
+            self._latched.add(name)
+        self._dispatch(name)
+
+    def on_release(self, key) -> None:
+        """Clear the latch so the next press is a new toggle."""
+        name = key if isinstance(key, str) else _resolve_pynput_key(key)
+        if name is None:
+            return
+        with self._lock:
+            self._latched.discard(name)
+            self._last_terminal_press.pop(name, None)
+
+    @property
+    def supports_releases(self) -> bool:
+        """Whether held-key auto-repeat is actually filtered on this backend."""
+        return self._releases_available
+
+
+def create_latching_key_listener(
+    dispatch: Callable[[str], None],
+    *,
+    controls_help: str = "",
+    pynput_factory=None,
+    terminal_factory=None,
+    terminal_enabled: bool = True,
+):
+    """Start a key listener whose key-downs are deduplicated while a key is held.
+
+    Same backend selection as :func:`create_key_listener`, plus key-release
+    tracking on pynput.  Used by the View Mask hotkeys, whose semantics are
+    "one press toggles once".  Returns the listener (exposing ``.stop()``) or
+    ``None`` when no backend is usable.
+
+    ``pynput_factory`` / ``terminal_factory`` exist so a single-backend test can
+    drive the latch logic without a display; production callers omit them.
+    """
+    suffix = f" ({controls_help})" if controls_help else ""
+
+    if pynput_factory is not None or (pynput_can_capture() and keyboard is not None):
+        listener_cls = keyboard.Listener if pynput_factory is None else pynput_factory
+        latch: LatchingKeyListener | None = None
+
+        if pynput_factory is None:
+            latch = LatchingKeyListener(dispatch, releases_available=True)
+            listener = listener_cls(on_press=latch.on_press, on_release=latch.on_release)
+            listener.start()
+            trusted = pynput_listener_is_trusted(listener)
+            if trusted:
+                logger.info("Keyboard listener started%s.", suffix)
+                return listener
+            logger.warning(
+                "pynput keyboard listener is not trusted (missing macOS Accessibility / "
+                "Input Monitoring permission); falling back to terminal keyboard input."
+            )
+            listener.stop()
+        else:
+            latch = LatchingKeyListener(dispatch, releases_available=False)
+            listener = listener_cls(on_press=latch.on_press)
+            listener.start()
+            logger.info("Keyboard listener started%s.", suffix)
+            return listener
+
+    if terminal_enabled and (terminal_factory is not None or sys.stdin.isatty()):
+        latch = LatchingKeyListener(dispatch, releases_available=False)
+        listener = (
+            terminal_factory(latch.on_press)
+            if terminal_factory is not None
+            else TerminalKeyListener(latch.on_press)
+        )
+        listener.start()
+        logger.info("Using terminal keyboard input — keep this terminal focused%s.", suffix)
+        return listener
+
+    if not terminal_enabled:
+        logger.info(
+            "Terminal View Mask hotkeys are disabled because stdin is reserved for the "
+            "interactive command reader%s.",
+            suffix,
+        )
+    else:
+        logger.warning(
+            "Keyboard controls unavailable: no usable display (Wayland/headless) and stdin is "
+            "not an interactive terminal%s.",
+            suffix,
+        )
     return None
 
 

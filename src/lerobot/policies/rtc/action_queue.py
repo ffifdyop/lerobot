@@ -43,8 +43,9 @@ class ActionQueue:
     1. RTC-enabled: Replaces the entire queue with new actions, accounting for inference delay
     2. RTC-disabled: Appends new actions to the queue, maintaining continuity
 
-    Every queued action is labeled, in lockstep and under the same lock, with the task whose
-    inference produced its chunk; ``get_with_task`` returns that label.
+    Every queued action is labeled, in lockstep and under the same lock, with the task and
+    (when supplied) the View Mask revision whose inference produced its chunk;
+    ``get_with_provenance`` returns both labels.
 
     Args:
         cfg (RTCConfig): Configuration for Real-Time Chunking behavior.
@@ -64,6 +65,9 @@ class ActionQueue:
         self.queue = None  # Processed actions for robot rollout
         self.original_queue = None  # Original actions for RTC
         self._task_queue: list[str | None] | None = None
+        # View Mask revision per queued action; None on every entry when view ablation
+        # is disabled, so the labels cost nothing on an ordinary RTC rollout.
+        self._mask_revision_queue: list[int | None] | None = None
         self.lock = Lock()
         self.last_index = 0
         self.cfg = cfg
@@ -75,11 +79,16 @@ class ActionQueue:
             Tensor | None: The next action (action_dim,) or None if queue is empty.
                           Returns a clone to prevent external modifications.
         """
-        queued = self.get_with_task()
+        queued = self.get_with_provenance()
         return None if queued is None else queued[0]
 
     def get_with_task(self) -> tuple[Tensor, str | None] | None:
         """Get the next action together with the task that generated its chunk."""
+        queued = self.get_with_provenance()
+        return None if queued is None else (queued[0], queued[1])
+
+    def get_with_provenance(self) -> tuple[Tensor, str | None, int | None] | None:
+        """Get the next action with the task *and* View Mask revision of its chunk."""
         with self.lock:
             if self.queue is None or self.last_index >= len(self.queue):
                 return None
@@ -91,10 +100,19 @@ class ActionQueue:
                     f"({len(self._task_queue)} labels for {len(self.queue)} actions) — "
                     "a queue mutation broke the action/task lockstep invariant"
                 )
+            if self._mask_revision_queue is not None and len(self._mask_revision_queue) != len(self.queue):
+                raise RuntimeError(
+                    f"ActionQueue view-mask labels out of sync with actions "
+                    f"({len(self._mask_revision_queue)} labels for {len(self.queue)} actions) — "
+                    "a queue mutation broke the action/provenance lockstep invariant"
+                )
             action = self.queue[self.last_index]
             task = None if self._task_queue is None else self._task_queue[self.last_index]
+            mask_revision = (
+                None if self._mask_revision_queue is None else self._mask_revision_queue[self.last_index]
+            )
             self.last_index += 1
-            return action.clone(), task
+            return action.clone(), task, mask_revision
 
     def clear(self) -> None:
         """Clear queued actions and reset consumption index."""
@@ -102,6 +120,7 @@ class ActionQueue:
             self.queue = None
             self.original_queue = None
             self._task_queue = None
+            self._mask_revision_queue = None
             self.last_index = 0
 
     def qsize(self) -> int:
@@ -170,6 +189,7 @@ class ActionQueue:
         action_index_before_inference: int | None = None,
         *,
         task: str | None = None,
+        mask_revision: int | None = None,
     ):
         """Merge new actions into the queue.
 
@@ -183,15 +203,17 @@ class ActionQueue:
             real_delay: Number of time steps of inference delay.
             action_index_before_inference: Index before inference started, for validation.
             task: Instruction used to generate the incoming action chunk.
+            mask_revision: View Mask revision the chunk was generated under.  ``None``
+                disables the label, keeping an ablation-free rollout unchanged.
         """
         with self.lock:
             delay = self._check_and_resolve_delays(real_delay, action_index_before_inference)
 
             if self.cfg.enabled:
-                self._replace_actions_queue(original_actions, processed_actions, delay, task)
+                self._replace_actions_queue(original_actions, processed_actions, delay, task, mask_revision)
                 return
 
-            self._append_actions_queue(original_actions, processed_actions, task)
+            self._append_actions_queue(original_actions, processed_actions, task, mask_revision)
 
     def _replace_actions_queue(
         self,
@@ -199,6 +221,7 @@ class ActionQueue:
         processed_actions: Tensor,
         real_delay: int,
         task: str | None,
+        mask_revision: int | None,
     ):
         """Replace the queue with new actions (RTC mode).
 
@@ -210,11 +233,17 @@ class ActionQueue:
             processed_actions: Post-processed actions for robot.
             real_delay: Number of time steps to skip due to inference delay.
             task: Instruction that generated the chunk; labels every queued action.
+            mask_revision: View Mask revision that generated the chunk.
         """
         clamped_delay = max(0, min(real_delay, len(original_actions), len(processed_actions)))
         self.original_queue = original_actions[clamped_delay:].clone()
         self.queue = processed_actions[clamped_delay:].clone()
         self._task_queue = [task] * len(self.queue)
+        # Keep the ordinary RTC path allocation-free: provenance is an opt-in
+        # rollout capability, not part of the native queue's default state.
+        self._mask_revision_queue = (
+            None if mask_revision is None else [mask_revision] * len(self.queue)
+        )
 
         logger.debug(f"original_actions shape: {self.original_queue.shape}")
         logger.debug(f"processed_actions shape: {self.queue.shape}")
@@ -222,7 +251,13 @@ class ActionQueue:
 
         self.last_index = 0
 
-    def _append_actions_queue(self, original_actions: Tensor, processed_actions: Tensor, task: str | None):
+    def _append_actions_queue(
+        self,
+        original_actions: Tensor,
+        processed_actions: Tensor,
+        task: str | None,
+        mask_revision: int | None,
+    ):
         """Append new actions to the queue (non-RTC mode).
 
         Removes already-consumed actions and appends new ones, maintaining
@@ -232,20 +267,35 @@ class ActionQueue:
             original_actions: Unprocessed actions from policy.
             processed_actions: Post-processed actions for robot.
             task: Instruction that generated the appended chunk; already-queued actions keep theirs.
+            mask_revision: View Mask revision that generated the appended chunk; like
+                the task label, already-queued actions keep theirs.
         """
         if self.queue is None:
             self.original_queue = original_actions.clone()
             self.queue = processed_actions.clone()
             self._task_queue = [task] * len(self.queue)
+            self._mask_revision_queue = (
+                None if mask_revision is None else [mask_revision] * len(self.queue)
+            )
             return
 
         existing_tasks = self._task_queue or [None] * len(self.queue)
+        if self._mask_revision_queue is None and mask_revision is None:
+            existing_masks = None
+        else:
+            existing_masks = self._mask_revision_queue or [None] * len(self.queue)
         self.original_queue = torch.cat([self.original_queue, original_actions.clone()])
         self.original_queue = self.original_queue[self.last_index :]
 
         self.queue = torch.cat([self.queue, processed_actions.clone()])
         self.queue = self.queue[self.last_index :]
         self._task_queue = existing_tasks[self.last_index :] + [task] * len(processed_actions)
+        if existing_masks is not None:
+            self._mask_revision_queue = existing_masks[self.last_index :] + [mask_revision] * len(
+                processed_actions
+            )
+        else:
+            self._mask_revision_queue = None
 
         self.last_index = 0
 

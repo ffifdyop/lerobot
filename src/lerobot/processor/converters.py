@@ -24,7 +24,17 @@ import numpy as np
 import torch
 
 from lerobot.lerobot_types import EnvTransition, PolicyAction, RobotAction, RobotObservation, TransitionKey
-from lerobot.utils.constants import ACTION, DONE, INFO, OBS_PREFIX, QUERY_KIND, QUERY_TEXT, REWARD, TRUNCATED
+from lerobot.utils.constants import (
+    ACTION,
+    DONE,
+    INFO,
+    OBS_PREFIX,
+    QUERY_KIND,
+    QUERY_TEXT,
+    REWARD,
+    RUNTIME_CONTEXT,
+    TRUNCATED,
+)
 
 
 @singledispatch
@@ -168,6 +178,10 @@ _COMPLEMENTARY_KEYS = (
     # processor step can read the kind and rewrite QUERY_TEXT.
     QUERY_KIND,
     QUERY_TEXT,
+    # Optional runtime metadata is carried through complementary_data for a
+    # rollout-owned processor step to consume.  The converter deliberately does
+    # not know which capability populated it.
+    RUNTIME_CONTEXT,
 )
 
 

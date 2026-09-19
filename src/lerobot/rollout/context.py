@@ -40,6 +40,7 @@ from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import (
     PolicyProcessorPipeline,
+    RenameObservationsProcessorStep,
     RobotAction,
     RobotObservation,
     RobotProcessorPipeline,
@@ -233,6 +234,8 @@ class PolicyContext:
     postprocessor: PolicyProcessorPipeline
     inference: InferenceEngine
     saliency: SaliencyManager | None = None
+    # View ablation runtime; None when ``--view_mask.enabled=false``.
+    view_mask: object | None = None
 
 
 @dataclass
@@ -271,6 +274,94 @@ class RolloutContext:
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
+
+
+def _find_rename_insert_index(preprocessor: PolicyProcessorPipeline) -> int:
+    """Index just past the last observation-rename step, i.e. where the mask step goes.
+
+    The mask must run *after* the rename (so it targets the canonical keys the policy
+    reads) and *before* every normalization and policy-specific image transform (so
+    the zeroed image is normalized exactly like any other frame).  When a pipeline has
+    no rename step at all the mask goes first, which is the same position for a
+    pipeline whose keys are already canonical.
+    """
+    last_rename = -1
+    for index, step in enumerate(preprocessor.steps):
+        if isinstance(step, RenameObservationsProcessorStep):
+            last_rename = index
+    return last_rename + 1
+
+
+#: Dataset feature names added by view ablation.  Absent entirely when disabled,
+#: so an ablation-free dataset schema is bit-for-bit what it was before.
+def _view_mask_dataset_features(canonical_views: tuple[str, ...]) -> dict:
+    """The two per-frame mask fields, named by canonical view key."""
+    return {
+        "view_mask": {
+            "dtype": "bool",
+            "shape": (len(canonical_views),),
+            # Names (not just a shape) so a resumed run can prove the vector means
+            # the same thing — the same views, in the same slot order.
+            "names": list(canonical_views),
+        },
+        "view_mask_revision": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": None,
+        },
+    }
+
+
+def _validate_view_mask_dataset(dataset: LeRobotDataset, canonical_views: tuple[str, ...]) -> None:
+    """Refuse to resume a dataset whose mask schema does not match this run.
+
+    Migration is deliberately not attempted: silently appending differently-shaped
+    or differently-named mask columns would produce a dataset whose frames cannot be
+    compared, which is worse than asking the operator to start a new recording.
+    """
+    features = dataset.meta.features if hasattr(dataset.meta, "features") else {}
+    problems: list[str] = []
+    for name, expected in _view_mask_dataset_features(canonical_views).items():
+        actual = features.get(name)
+        if actual is None:
+            problems.append(f"{name!r} is missing")
+            continue
+        if actual.get("dtype") != expected["dtype"]:
+            problems.append(f"{name!r} dtype is {actual.get('dtype')!r}, expected {expected['dtype']!r}")
+        elif tuple(actual.get("shape", ())) != tuple(expected["shape"]):
+            problems.append(f"{name!r} shape is {actual.get('shape')}, expected {expected['shape']}")
+        elif name == "view_mask" and list(actual.get("names") or []) != list(canonical_views):
+            problems.append(
+                f"{name!r} names are {actual.get('names')}, expected {list(canonical_views)}"
+            )
+    if problems:
+        raise ValueError(
+            "Cannot --resume this dataset with view ablation enabled: "
+            + "; ".join(problems)
+            + ". Start a new dataset (drop --resume) — the mask schema cannot be migrated."
+        )
+
+
+def _inject_view_mask_step(preprocessor: PolicyProcessorPipeline) -> None:
+    """Splice the View Mask step into the checkpoint preprocessor, in memory only.
+
+    Deliberately not written back to the checkpoint's processor config: the step is a
+    rollout runtime concern, and persisting it would make every other consumer of the
+    checkpoint (eval, record) silently mask the same views.
+    """
+    from .view_mask.processor import ViewMaskProcessorStep
+
+    if any(isinstance(step, ViewMaskProcessorStep) for step in preprocessor.steps):
+        return
+    steps = list(preprocessor.steps)
+    insert_at = _find_rename_insert_index(preprocessor)
+    steps.insert(insert_at, ViewMaskProcessorStep())
+    preprocessor.steps = steps
+    logger.info(
+        "View ablation: mask processor injected at preprocessor step %d of %d",
+        insert_at,
+        len(steps),
+    )
 
 
 def _load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy:
@@ -392,6 +483,7 @@ def build_rollout_context(
             load_policy=_load_explainer_policy,
         )
 
+    view_mask_runtime = None
     try:
         torch_compile_active = cfg.use_torch_compile
         if cfg.use_torch_compile and policy.type not in ("pi0", "pi05"):
@@ -532,9 +624,30 @@ def build_rollout_context(
                 )
 
         # --- 5. Dataset -------------
+        # View ablation's dataset fields must exist before create() or be verified
+        # before resume(), so the plan is resolved here rather than after the engine.
+        view_mask_plan = None
+        if cfg.view_mask.enabled:
+            from .view_mask.config import build_view_mask_plan
+
+            view_mask_plan = build_view_mask_plan(
+                cfg.view_mask,
+                policy_view_keys=[
+                    key
+                    for key, feature in policy_config.input_features.items()
+                    if feature.type is FeatureType.VISUAL
+                ],
+                robot_camera_keys=[
+                    key for key, shape in all_obs_features.items() if isinstance(shape, tuple)
+                ],
+                rename_map=cfg.rename_map,
+            )
+
         dataset = None
         if cfg.dataset is not None and not isinstance(cfg.strategy, BaseStrategyConfig):
             logger.info("Setting up dataset (repo_id=%s)...", cfg.dataset.repo_id)
+            if view_mask_plan is not None:
+                dataset_features.update(_view_mask_dataset_features(view_mask_plan.canonical_views))
             if cfg.resume:
                 dataset = LeRobotDataset.resume(
                     cfg.dataset.repo_id,
@@ -549,6 +662,8 @@ def build_rollout_context(
                     image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera
                     * len(robot.cameras if hasattr(robot, "cameras") else []),
                 )
+                if view_mask_plan is not None:
+                    _validate_view_mask_dataset(dataset, view_mask_plan.canonical_views)
             else:
                 if isinstance(cfg.strategy, DAggerStrategyConfig):
                     dataset_features["intervention"] = {
@@ -620,6 +735,26 @@ def build_rollout_context(
                 "Use --inference.type=rtc or remove relative action processor steps from the policy pipeline."
             )
 
+        # --- 6b. View ablation (needs policy features + robot cameras) -----
+        # Built after the pre/post processors exist so the mask step can be spliced
+        # into the checkpoint preprocessor, and before the engine so the engine can
+        # register itself as the transition-flush sink.
+        if view_mask_plan is not None:
+            from .view_mask.setup import build_view_mask_runtime, strategy_hotkey_claims
+
+            view_mask_runtime = build_view_mask_runtime(
+                cfg.view_mask,
+                policy_config,
+                robot_camera_keys=[
+                    key for key, shape in all_obs_features.items() if isinstance(shape, tuple)
+                ],
+                rename_map=cfg.rename_map,
+                dataset_root=str(dataset.root) if dataset is not None else None,
+                key_claims=strategy_hotkey_claims(cfg.strategy, cfg.teleop),
+                interactive=cfg.interactive,
+            )
+            _inject_view_mask_step(preprocessor)
+
         # --- 7. Inference strategy (needs policy + pre/post + hardware) --
         logger.info(
             "Creating inference engine (type=%s)...",
@@ -642,6 +777,8 @@ def build_rollout_context(
             compile_warmup_inferences=cfg.compile_warmup_inferences,
             shutdown_event=shutdown_event,
         )
+        if view_mask_runtime is not None:
+            inference_strategy.attach_view_mask(view_mask_runtime)
 
         if saliency_manager is not None:
             # Validation guarantees cfg.inference is RTC when saliency is enabled. Probe the
@@ -671,6 +808,7 @@ def build_rollout_context(
                 postprocessor=postprocessor,
                 inference=inference_strategy,
                 saliency=saliency_manager,
+                view_mask=view_mask_runtime,
             ),
             processors=ProcessorContext(
                 teleop_action_processor=teleop_action_processor,
@@ -690,4 +828,7 @@ def build_rollout_context(
         if saliency_manager is not None:
             logger.warning("Rollout context build failed; stopping saliency recorder")
             saliency_manager.stop()
+        if view_mask_runtime is not None:
+            logger.warning("Rollout context build failed; stopping View Mask runtime")
+            view_mask_runtime.stop()
         raise

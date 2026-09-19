@@ -84,6 +84,8 @@ class EpisodicStrategy(RolloutStrategy):
     def setup(self, ctx: RolloutContext) -> None:
         """Start the inference engine and attach the keyboard listener."""
         self._init_engine(ctx)
+        self._attach_view_mask(ctx)
+        self._view_mask_dataset = ctx.data.dataset if self._view_mask is not None else None
         self._listener, self._events = init_keyboard_listener()
         logger.info("Episodic strategy ready")
 
@@ -254,11 +256,26 @@ class EpisodicStrategy(RolloutStrategy):
             if self._handle_warmup(ctx.runtime.cfg.use_torch_compile, timer):
                 continue
 
-            action_dict = send_next_action(obs_processed, obs, ctx, interpolator, timer)
+            applying = self._view_mask_tick(ctx, runnable=True)
+            if applying:
+                with timer.section("telemetry"):
+                    self._log_view_mask(ctx.runtime)
+                if self._view_mask_failed_should_stop(ctx):
+                    logger.error("View mask failed; ending rollout segment")
+                    break
+                action_dict = send_next_action(obs_processed, obs, ctx, interpolator, timer)
+                if action_dict is None:
+                    timer.wait()
+                    timestamp = time.perf_counter() - start_t
+                    continue
+            else:
+                action_dict = send_next_action(obs_processed, obs, ctx, interpolator, timer)
 
-            if action_dict is not None:
+            mask_fields = self._view_mask_frame_fields(human=False)
+            if action_dict is not None and (mask_fields is not None or self._view_mask is None):
                 with timer.section("telemetry"):
                     self._log_telemetry(obs_processed, action_dict, ctx.runtime)
+                    self._log_view_mask(ctx.runtime)
                 # Record once per interpolation cycle so the dataset cadence
                 # matches its declared fps; interpolated ticks only send
                 # commands to the robot.
@@ -266,7 +283,11 @@ class EpisodicStrategy(RolloutStrategy):
                     with timer.section("record"):
                         obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
                         action_frame = build_dataset_frame(features, action_dict, prefix=ACTION)
-                        dataset.add_frame({**obs_frame, **action_frame, "task": single_task})
+                        frame = {**obs_frame, **action_frame, "task": single_task}
+                        if mask_fields is not None:
+                            frame.update(mask_fields)
+                        dataset.add_frame(frame)
+                        self._note_recorded_frame(dataset)
 
             timer.wait()
             timestamp = time.perf_counter() - start_t

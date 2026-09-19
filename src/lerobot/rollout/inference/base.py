@@ -120,7 +120,6 @@ class InferenceEngine(abc.ABC):
         self._task_changed = False
         self._dispatched_task = task
         self._task_lock = Lock()
-
         # Text-query channel.  Its own lock, never held across a text generation.
         self._query_lock = Lock()
         self._pending_query: PolicyQuery | None = None
@@ -302,6 +301,8 @@ class InferenceEngine(abc.ABC):
         """Queue the next-subtask query if the sequencer is due (control loop only)."""
         if obs_processed is None:
             return
+        if not self._autosteer_queries_allowed():
+            return
         with self._query_lock:
             if self._autosteer_goal is None:
                 return
@@ -313,6 +314,10 @@ class InferenceEngine(abc.ABC):
                 return
             self._pending_query = PolicyQuery(kind=QueryKind.NEXT_SUBTASK, text=self._autosteer_goal)
 
+    def _autosteer_queries_allowed(self) -> bool:
+        """Whether the backend may queue an automatic planning query this tick."""
+        return True
+
     def _take_query(self) -> PolicyQuery | None:
         """Claim the pending query.  Call from the policy-owning thread."""
         with self._query_lock:
@@ -321,11 +326,17 @@ class InferenceEngine(abc.ABC):
                 self._query_in_flight = True
             return query
 
-    def _service_query(self, obs_processed: dict | None) -> bool:
+    def _service_query(
+        self,
+        obs_processed: dict | None,
+        *,
+        result_guard: Callable[[], bool] | None = None,
+    ) -> bool:
         """Serve a pending query.  Call ONLY from the policy-owning thread.
 
         Failures become error answers instead of exceptions, so a bad query never takes
-        down the calling thread.  Returns ``True`` when a query was claimed and served.
+        down the calling thread.  A backend may provide a revision guard to discard
+        output whose inference context changed while text was generated.
         """
         if obs_processed is None:
             return False
@@ -342,18 +353,37 @@ class InferenceEngine(abc.ABC):
                 )
         except Exception as e:
             logger.exception("Policy text query failed (%s) for %r", query.kind.value, query.text)
+            if result_guard is not None and not result_guard():
+                self._discard_query_result(query)
+                return True
             if query.kind is QueryKind.NEXT_SUBTASK and not self._fail_subtask(query):
                 return True  # the sequencer this turn belonged to is gone; discard
             self._publish_answer(
                 QueryAnswer(question=query.text, error=f"{type(e).__name__}: {e}", kind=query.kind)
             )
             return True
+        if result_guard is not None and not result_guard():
+            self._discard_query_result(query)
+            return True
         if query.kind is QueryKind.NEXT_SUBTASK and not self._apply_subtask(query, text):
             return True  # sequencer stopped meanwhile; the turn was discarded
         # Published after being applied, so an announcing observer never gets ahead of
         # the task it describes.
+        if result_guard is not None and not result_guard():
+            self._discard_query_result(query)
+            return True
         self._publish_answer(QueryAnswer(question=query.text, answer=text, kind=query.kind))
         return True
+
+    def _discard_query_result(self, query: PolicyQuery) -> None:
+        """Clear an in-flight query without publishing a stale answer or task."""
+        with self._query_lock:
+            self._query_in_flight = False
+        logger.info(
+            "Discarding %s result for %r because its inference context is no longer current",
+            query.kind.value,
+            query.text,
+        )
 
     def _fail_subtask(self, query: PolicyQuery) -> bool:
         """Stop the sequencer after a failed turn — unless it stopped or retargeted meanwhile.
