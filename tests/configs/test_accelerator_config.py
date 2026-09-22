@@ -24,6 +24,7 @@ from lerobot.configs.accelerator import (
     ActivationCheckpointingConfig,
     ActivationCheckpointingMode,
     CompileConfig,
+    DDPCommunicationHook,
     DDPConfig,
     FSDPConfig,
     GradientAccumulationConfig,
@@ -48,6 +49,10 @@ class TestFieldValidation:
         with pytest.raises(ValueError, match="gradient_accumulation.steps"):
             GradientAccumulationConfig(steps=0)
 
+    def test_ddp_bucket_size_positive(self):
+        with pytest.raises(ValueError, match="ddp.bucket_cap_mb"):
+            DDPConfig(bucket_cap_mb=0)
+
 
 class TestDraccusRoundTrip:
     @pytest.mark.parametrize(
@@ -63,7 +68,12 @@ class TestDraccusRoundTrip:
                     cpu_offload=True,
                     ignored_modules=r".*pos_embed.*",
                 ),
-                ddp=DDPConfig(find_unused_parameters=False, static_graph=True),
+                ddp=DDPConfig(
+                    find_unused_parameters=False,
+                    static_graph=True,
+                    bucket_cap_mb=100,
+                    comm_hook=DDPCommunicationHook.BF16,
+                ),
                 compile=CompileConfig(enabled=True, mode="max-autotune", regional=False),
                 activation_checkpointing=ActivationCheckpointingConfig(mode=ActivationCheckpointingMode.FULL),
             ),
@@ -104,9 +114,16 @@ class TestRuntimeBuilders:
         assert plugin.transformer_cls_names_to_wrap is None
 
     def test_ddp_kwargs_translation(self):
-        handler = DDPConfig(find_unused_parameters=False, gradient_as_bucket_view=True).build_kwargs_handler()
+        handler = DDPConfig(
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,
+            bucket_cap_mb=100,
+            comm_hook=DDPCommunicationHook.BF16,
+        ).build_kwargs_handler()
         assert handler.find_unused_parameters is False
         assert handler.gradient_as_bucket_view is True
+        assert handler.bucket_cap_mb == 100
+        assert handler.comm_hook.value == "bf16"
 
     def test_gradient_accumulation_plugin_translation(self):
         plugin = GradientAccumulationConfig(steps=4).build_plugin()

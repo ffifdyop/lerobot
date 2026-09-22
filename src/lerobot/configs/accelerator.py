@@ -93,6 +93,14 @@ class FSDPConfig:
         )
 
 
+class DDPCommunicationHook(str, Enum):
+    """Gradient communication transformation applied by DDP."""
+
+    # Do not use "no": YAML/Draccus parses it as the boolean False.
+    NONE = "none"
+    BF16 = "bf16"
+
+
 @dataclass
 class DDPConfig:
     """Mirror of the `DistributedDataParallelKwargs` subset LeRobot exposes."""
@@ -101,6 +109,17 @@ class DDPConfig:
     find_unused_parameters: bool = True
     gradient_as_bucket_view: bool = False
     static_graph: bool = False
+    # Larger buckets reduce collective-launch overhead, at the cost of later
+    # communication and a larger temporary buffer.
+    bucket_cap_mb: int = 25
+    # ``bf16`` compresses each gradient bucket only for the all-reduce. The
+    # reduced gradients are restored to their original dtype before the
+    # optimizer step, so FP32 model and optimizer states remain FP32.
+    comm_hook: DDPCommunicationHook = DDPCommunicationHook.NONE
+
+    def __post_init__(self) -> None:
+        if self.bucket_cap_mb < 1:
+            raise ValueError(f"ddp.bucket_cap_mb must be >= 1, got {self.bucket_cap_mb}.")
 
     def build_kwargs_handler(self) -> "DistributedDataParallelKwargs":
         """Build the DDP kwargs handler for `Accelerator(kwargs_handlers=[...])`.
@@ -109,12 +128,16 @@ class DDPConfig:
             DistributedDataParallelKwargs: Handler carrying the mirrored DDP fields, applied
                 by accelerate when it wraps the model in `DistributedDataParallel`.
         """
-        from accelerate.utils import DistributedDataParallelKwargs
+        from accelerate.utils import DDPCommunicationHookType, DistributedDataParallelKwargs
 
         return DistributedDataParallelKwargs(
             find_unused_parameters=self.find_unused_parameters,
             gradient_as_bucket_view=self.gradient_as_bucket_view,
             static_graph=self.static_graph,
+            bucket_cap_mb=self.bucket_cap_mb,
+            comm_hook=DDPCommunicationHookType.NO
+            if self.comm_hook is DDPCommunicationHook.NONE
+            else DDPCommunicationHookType.BF16,
         )
 
 
