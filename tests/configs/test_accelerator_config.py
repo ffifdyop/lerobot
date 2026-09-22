@@ -26,6 +26,7 @@ from lerobot.configs.accelerator import (
     ActivationCheckpointingConfig,
     ActivationCheckpointingMode,
     CompileConfig,
+    DDPCommunicationHook,
     DDPConfig,
     FSDPConfig,
     GradientAccumulationConfig,
@@ -82,6 +83,9 @@ class TestFieldValidation:
     def test_mixed_precision_policy_matches_mixed_precision(self, mixed_precision, policy, match):
         with pytest.raises(ValueError, match=match):
             AcceleratorConfig(mixed_precision=mixed_precision, fsdp=FSDPConfig(mixed_precision_policy=policy))
+    def test_ddp_bucket_size_positive(self):
+        with pytest.raises(ValueError, match="ddp.bucket_cap_mb"):
+            DDPConfig(bucket_cap_mb=0)
 
 
 class TestDraccusRoundTrip:
@@ -101,9 +105,14 @@ class TestDraccusRoundTrip:
                         param_dtype=torch.bfloat16, cast_forward_inputs=False
                     ),
                 ),
-                ddp=DDPConfig(find_unused_parameters=False, static_graph=True),
                 init_process_group=InitProcessGroupConfig(backend="gloo", timeout=3600),
                 grad_scaler=GradScalerConfig(init_scale=1024.0, growth_interval=500),
+                ddp=DDPConfig(
+                    find_unused_parameters=False,
+                    static_graph=True,
+                    bucket_cap_mb=100,
+                    comm_hook=DDPCommunicationHook.BF16,
+                ),
                 compile=CompileConfig(enabled=True, mode="max-autotune", regional=False),
                 activation_checkpointing=ActivationCheckpointingConfig(mode=ActivationCheckpointingMode.FULL),
             ),
@@ -146,9 +155,16 @@ class TestRuntimeBuilders:
         assert plugin.transformer_cls_names_to_wrap is None
 
     def test_ddp_kwargs_translation(self):
-        handler = DDPConfig(find_unused_parameters=False, gradient_as_bucket_view=True).build_kwargs_handler()
+        handler = DDPConfig(
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,
+            bucket_cap_mb=100,
+            comm_hook=DDPCommunicationHook.BF16,
+        ).build_kwargs_handler()
         assert handler.find_unused_parameters is False
         assert handler.gradient_as_bucket_view is True
+        assert handler.bucket_cap_mb == 100
+        assert handler.comm_hook.value == "bf16"
 
     def test_init_process_group_kwargs_translation(self):
         handler = InitProcessGroupConfig(
