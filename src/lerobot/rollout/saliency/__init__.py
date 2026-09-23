@@ -11,12 +11,18 @@ from .config import SaliencyConfig
 from .explainer import Explainer, get_explainer_cls, register_explainer
 from .smolvla import SmolVLAExplainer
 from .smolvla_attention import SmolVLAAttentionExplainer
+from .pi import PI0Explainer, PI05Explainer
+from .pi_attention import PI0AttentionExplainer, PI05AttentionExplainer
 
 __all__ = [
     "Explainer",
     "SaliencyConfig",
     "SmolVLAAttentionExplainer",
     "SmolVLAExplainer",
+    "PI0Explainer",
+    "PI05Explainer",
+    "PI0AttentionExplainer",
+    "PI05AttentionExplainer",
     "get_explainer_cls",
     "register_explainer",
 ]

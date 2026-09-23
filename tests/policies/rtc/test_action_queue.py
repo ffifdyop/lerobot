@@ -365,6 +365,23 @@ def test_merge_with_large_delay(action_queue_rtc_enabled, sample_actions):
     assert action_queue_rtc_enabled.qsize() == 0
 
 
+def test_merge_preserves_actual_target_and_empty_state(action_queue_rtc_enabled, sample_actions):
+    accepted = action_queue_rtc_enabled.merge(
+        sample_actions["original"], sample_actions["processed"], real_delay=7
+    )
+
+    assert accepted is True
+    torch.testing.assert_close(action_queue_rtc_enabled.get_left_over(), sample_actions["original"][7:])
+    torch.testing.assert_close(action_queue_rtc_enabled.get(), sample_actions["processed"][7])
+
+    accepted = action_queue_rtc_enabled.merge(
+        sample_actions["short"], sample_actions["short"], real_delay=100
+    )
+    assert accepted is True
+    assert action_queue_rtc_enabled.empty()
+    assert action_queue_rtc_enabled.get() is None
+
+
 # merge() with RTC disabled tests
 
 

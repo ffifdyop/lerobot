@@ -13,14 +13,14 @@
 # limitations under the License.
 """SmolVLA attention Explainer: Patch Attention Map + Attention Budget Bar (see CONTEXT.md).
 
-Replays the executed chunk (same batch, same injected noise, same chunk kwargs — the same
+Replays the accepted chunk (same batch, same injected noise, same chunk kwargs — the same
 contract as the grad_x_input explainer) under ``torch.no_grad`` and taps the eager attention
 path via ``SmolVLMWithExpertModel.attention_capture``. Only ``kind == "cross"`` events are
 consumed: pure cross-attention (odd layers, suffix queries over prefix keys only) exists
 by construction only during denoising, so no query-count filtering is needed.
 
 Semantics (openspec change add-attention-saliency, design D3-D6):
-- a₀ query only (first suffix token — the action currently being executed);
+- a_d query only (the suffix query corresponding to the first action retained by RTC);
 - per event: mean over heads; then mean over all cross events (odd layers × denoise steps);
 - raw shares, never renormalized over image tokens (a model attending to language goes dark);
 - per-camera 8×8 patch grids sliced from contiguous 64-column prefix segments;
@@ -35,6 +35,7 @@ import torch
 from lerobot.policies.utils import populate_queues
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 
+from .attention import AttentionAccumulator
 from .explainer import Explainer, register_explainer
 
 # SmolVLA letterboxes to 512×512; the SmolVLM connector (patch 16, pixel_shuffle scale 4)
@@ -46,15 +47,14 @@ TOKENS_PER_CAMERA = PATCH_GRID * PATCH_GRID  # 64
 
 @register_explainer("smolvla", method="attention")
 class SmolVLAAttentionExplainer(Explainer):
-    """a₀'s cross-attention share over image patch tokens, per camera, plus the budget split."""
+    """a_d's cross-attention share over image patch tokens, per camera, plus the budget split."""
 
     map_kind: str = "patch"
 
     def __init__(self, policy) -> None:
         super().__init__(policy)
         self._vlm = policy.model.vlm_with_expert
-        self._acc: torch.Tensor | None = None  # (Lk,) float32, sum of per-event head-mean rows
-        self._events = 0
+        self._accumulator = AttentionAccumulator()
         # Per-instance tap on THIS model copy only; the control-loop model's attribute stays None.
         self._vlm.attention_capture = self._on_attention
         # Last five-way budget: {cam_key: mass, ..., "language": mass, "state": mass}. Read by
@@ -68,13 +68,14 @@ class SmolVLAAttentionExplainer(Explainer):
     def _on_attention(self, layer_idx: int, probs: torch.Tensor, kind: str) -> None:
         if kind != "cross":
             return
-        # a₀ = first suffix query row; mean over heads; float32; never retain the full probs.
-        row = probs[0, :, 0, :].mean(dim=0).detach()
-        if self._acc is None:
-            self._acc = row.to(torch.float32).clone()
-        else:
-            self._acc += row.to(torch.float32)
-        self._events += 1
+        step = getattr(self._vlm, "attention_step", None)
+        # Select the action retained at the queue's actual target index; mean over heads; float32; never
+        # retain the full probability matrix.
+        row_index = getattr(self, "_query_index", 0)
+        if probs.ndim != 4 or not 0 <= row_index < probs.shape[2]:
+            raise RuntimeError("SmolVLA attention query layout mismatch")
+        row = probs[0, :, row_index, :].detach().float().mean(dim=0)
+        self._accumulator.add(layer_idx, step, row)
 
     def compute_saliency(
         self,
@@ -92,7 +93,7 @@ class SmolVLAAttentionExplainer(Explainer):
         if noise is None:
             raise ValueError(
                 "Saliency replay requires the injected noise tensor (snapshot came from an engine "
-                "without noise injection); exact replay of the executed chunk is impossible"
+                "without noise injection); replay of the accepted chunk is impossible"
             )
         policy.eval()
         device = next(policy.parameters()).device
@@ -106,8 +107,11 @@ class SmolVLAAttentionExplainer(Explainer):
             k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in (chunk_kwargs or {}).items()
         }
 
-        self._acc = None
-        self._events = 0
+        self._query_index = int((chunk_kwargs or {}).get("target_action_index", 0))
+        self._accumulator = AttentionAccumulator(
+            getattr(self, "attention_layers", None), getattr(self, "attention_steps", None)
+        )
+        self.last_budget = None
         with torch.no_grad():
             batch = policy._prepare_batch(batch)
             policy._queues = populate_queues(policy._queues, batch, exclude_keys=[ACTION])
@@ -121,26 +125,36 @@ class SmolVLAAttentionExplainer(Explainer):
             lang_tokens = batch[OBS_LANGUAGE_TOKENS]
             lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
 
-            policy.model.sample_actions(
-                images, img_masks, lang_tokens, lang_masks, state, noise=noise, **chunk_kwargs
-            )
+            try:
+                policy.model.sample_actions(
+                    images, img_masks, lang_tokens, lang_masks, state, noise=noise, **chunk_kwargs
+                )
+            finally:
+                self._vlm.attention_step = None
 
-        if self._acc is None or self._events == 0:
-            raise RuntimeError(
-                "No cross-attention events captured during replay: the attention_capture tap is "
-                "broken or this policy has no cross-attention layers"
-            )
-        mean_row = (self._acc / self._events).cpu().numpy()  # (Lk,) float32
+        num_steps = policy.model._attention_num_steps
+        vlm = policy.model.vlm_with_expert
+        num_layers = vlm.num_vlm_layers
+        multiple = num_layers // vlm.num_expert_layers
+        self_every = vlm.self_attn_every_n_layers
+        valid_layers = {
+            layer
+            for layer in range(num_layers)
+            if layer % multiple == 0 and not (self_every > 0 and layer % self_every == 0)
+        }
+        mean_row = self._accumulator.mean(valid_layers, num_steps).cpu().numpy()
 
-        # Column attribution: cameras are contiguous 64-token segments in prefix order, then
-        # tokenizer_max_length language columns (padding carries no mass), then 1 state column.
-        n_cam = len(img_keys)
+        # Column attribution: prepared image slots (real cameras followed by any configured
+        # empty-camera placeholders) are contiguous 64-token segments in prefix order, then
+        # tokenizer_max_length language columns and one state column.  Missing cameras are
+        # never mapped onto a neighboring view; their masked slot remains budget-only.
+        n_image_slots = len(images)
         lang_len = policy.config.tokenizer_max_length
-        expected = TOKENS_PER_CAMERA * n_cam + lang_len + 1
+        expected = TOKENS_PER_CAMERA * n_image_slots + lang_len + 1
         if mean_row.shape[0] != expected:
             raise RuntimeError(
                 f"Prefix layout mismatch: attention has {mean_row.shape[0]} keys, expected "
-                f"{expected} (= {TOKENS_PER_CAMERA}×{n_cam} cameras + {lang_len} language + 1 "
+                f"{expected} (= {TOKENS_PER_CAMERA}×{n_image_slots} image slots + {lang_len} language + 1 "
                 "state). The checkpoint's prefix layout changed (pad_language_to != "
                 "'max_length'? add_image_special_tokens? prefix_length?) — refusing to guess."
             )
@@ -151,8 +165,8 @@ class SmolVLAAttentionExplainer(Explainer):
             seg = mean_row[i * TOKENS_PER_CAMERA : (i + 1) * TOKENS_PER_CAMERA]
             maps[key] = seg.reshape(PATCH_GRID, PATCH_GRID).astype(np.float32)
             budget[key] = float(seg.sum())
-        lang_end = TOKENS_PER_CAMERA * n_cam + lang_len
-        budget["language"] = float(mean_row[TOKENS_PER_CAMERA * n_cam : lang_end].sum())
+        lang_end = TOKENS_PER_CAMERA * n_image_slots + lang_len
+        budget["language"] = float(mean_row[TOKENS_PER_CAMERA * n_image_slots : lang_end].sum())
         budget["state"] = float(mean_row[-1])
         self.last_budget = budget
         return maps

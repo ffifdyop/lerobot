@@ -60,17 +60,32 @@ class SaliencyManager:
             policy_config.type, saliency_cfg.method
         )  # fail fast, before weights load
 
+        if getattr(saliency_cfg, "enabled", True) and policy_config.type == "pi05" and (
+            getattr(policy_config, "use_visual_memory", False)
+            or getattr(policy_config, "use_proprioceptive_memory", False)
+        ):
+            raise ValueError(
+                "PI0.5 saliency does not support MEM replay yet; disable use_visual_memory and "
+                "use_proprioceptive_memory or run without saliency"
+            )
+
         # Patch overlays need the policy's letterbox target to place the token grid. SmolVLA
         # stores it as (width, height) (modeling_smolvla.py passes [1]/[0] to resize_with_pad);
         # the overlay math wants (h, w). Attention saliency without letterboxing (None) has no
         # well-defined patch→pixel mapping: fail fast at startup rather than misrender.
         rwp = getattr(policy_config, "resize_imgs_with_padding", None)
-        if saliency_cfg.method == "attention" and rwp is None:
+        image_resolution = getattr(policy_config, "image_resolution", None)
+        if saliency_cfg.method == "attention" and rwp is None and image_resolution is None:
             raise ValueError(
                 "--saliency.method=attention requires the policy to letterbox images "
                 "(resize_imgs_with_padding); got None"
             )
-        letterbox_hw = (rwp[1], rwp[0]) if rwp is not None else (512, 512)
+        if rwp is not None:
+            letterbox_hw = (rwp[1], rwp[0])
+        elif image_resolution is not None:
+            letterbox_hw = (image_resolution[0], image_resolution[1])
+        else:
+            letterbox_hw = (512, 512)
 
         self.device = resolve_explainer_device(saliency_cfg.device, policy_device)
         policy_copy = load_policy()
@@ -79,6 +94,46 @@ class SaliencyManager:
         for p in policy_copy.parameters():
             p.requires_grad_(False)  # differentiate wrt input pixels only
         self._explainer = explainer_cls(policy_copy)
+        self._explainer.attention_layers = getattr(saliency_cfg, "attention_layers", None)
+        self._explainer.attention_steps = getattr(saliency_cfg, "attention_steps", None)
+        if saliency_cfg.method == "attention" and (
+            self._explainer.attention_layers is not None or self._explainer.attention_steps is not None
+        ):
+            if policy_config.type == "smolvla":
+                vlm = policy_copy.model.vlm_with_expert
+                num_layers = int(getattr(vlm, "num_vlm_layers", 0))
+                num_expert_layers = int(getattr(vlm, "num_expert_layers", num_layers))
+                multiple = max(1, num_layers // max(1, num_expert_layers))
+                self_every = int(getattr(vlm, "self_attn_every_n_layers", 0))
+                valid_layers = {
+                    layer
+                    for layer in range(num_layers)
+                    if layer % multiple == 0 and not (self_every > 0 and layer % self_every == 0)
+                }
+                valid_step_count = int(getattr(policy_copy.config, "num_steps", 0))
+            else:
+                valid_layers = set(range(len(policy_copy.model.paligemma_with_expert.gemma_expert.model.layers)))
+                valid_step_count = int(
+                    getattr(policy_copy.config, "num_inference_steps", getattr(policy_copy.config, "num_steps", 0))
+                )
+            if self._explainer.attention_layers is not None and not set(self._explainer.attention_layers).issubset(
+                valid_layers
+            ):
+                raise ValueError(
+                    f"--saliency.attention_layers contains a non-capturable layer; valid layers are "
+                    f"{sorted(valid_layers)}"
+                )
+            if self._explainer.attention_steps is not None and any(
+                value >= valid_step_count for value in self._explainer.attention_steps
+            ):
+                if valid_step_count <= 0:
+                    raise ValueError(
+                        "Unable to determine valid denoising steps for attention selection"
+                    )
+                raise ValueError(
+                    f"--saliency.attention_steps contains an out-of-range index; valid range is "
+                    f"[0, {valid_step_count})"
+                )
 
         output_dir = saliency_cfg.output_dir or os.path.join(
             "outputs", "saliency", time.strftime("%Y%m%d_%H%M%S")
@@ -119,6 +174,9 @@ class SaliencyManager:
         moved on: the overlay would describe a scene the operator already changed.
         """
         self._recorder.set_view_mask(runtime)
+
+    def set_reset_epoch(self, epoch: int) -> None:
+        self._recorder.set_reset_epoch(epoch)
 
     def stop(self) -> None:
         """Flush and close the overlay videos, and detach any model tap the explainer holds."""

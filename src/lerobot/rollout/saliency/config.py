@@ -23,8 +23,8 @@ class SaliencyConfig:
 
     # Master switch. Requires a local policy with a registered Explainer and the RTC inference engine.
     enabled: bool = False
-    # Saliency method: "grad_x_input" = pixel sensitivity (∂‖a₀‖²/∂x), "attention" = patch
-    # attention map (a₀'s cross-attention share over each camera's 8×8 patch tokens).
+    # Saliency method: "grad_x_input" = pixel sensitivity (∂‖a_d‖²/∂x), "attention" = patch
+    # attention map (a_d's cross-attention share over each camera's patch tokens).
     # "integrated" is a planned upgrade.
     method: str = "grad_x_input"
     # Stream overlay frames to rerun entities ``saliency/<camera>`` (requires --display_data).
@@ -44,6 +44,9 @@ class SaliencyConfig:
     # "chunk" = recompute the shared-across-cameras range per chunk (best local contrast, but a
     # quiet moment is stretched to full red just like a hot one).
     norm_scope: str = "run"
+    # Optional zero-based action-expert attention layers/denoising steps. None means all.
+    attention_layers: list[int] | None = None
+    attention_steps: list[int] | None = None
 
 
 def validate_saliency(
@@ -75,6 +78,16 @@ def validate_saliency(
         raise ValueError(f"--saliency.alpha must be in (0, 1), got {saliency.alpha}")
     if saliency.norm_scope not in ("run", "chunk"):
         raise ValueError(f"--saliency.norm_scope must be 'run' or 'chunk', got {saliency.norm_scope!r}")
+    for name, values in (("attention_layers", saliency.attention_layers), ("attention_steps", saliency.attention_steps)):
+        if values is not None:
+            if not values:
+                raise ValueError(f"--saliency.{name} cannot be empty; use null for all values")
+            if any(not isinstance(value, int) or value < 0 for value in values):
+                raise ValueError(f"--saliency.{name} must contain unique non-negative integers")
+            if len(set(values)) != len(values):
+                raise ValueError(f"--saliency.{name} must not contain duplicates")
+    if saliency.method != "attention" and (saliency.attention_layers is not None or saliency.attention_steps is not None):
+        raise ValueError("--saliency.attention_layers/attention_steps require --saliency.method=attention")
     if use_torch_compile:
         # Not fatal: compiled inductor graphs may reorder FP ops, so the eager replay is
         # approximate rather than deterministic. Warn loudly instead of failing.

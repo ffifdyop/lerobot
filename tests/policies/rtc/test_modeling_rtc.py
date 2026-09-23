@@ -275,6 +275,51 @@ def test_get_prefix_weights_with_start_greater_than_end():
     assert torch.all(weights[10:] == 0.0)
 
 
+def test_guided_saliency_replay_preserves_forward_and_input_gradient():
+    """The sidecar graph path is value-equivalent and matches a finite difference.
+
+    The production RTC call keeps its historical detached inner Jacobian.  The
+    ``preserve_graph`` path only retains the outer image/latent graph needed by
+    saliency; it must not silently change the guided action values.
+    """
+    config = RTCConfig(
+        prefix_attention_schedule=RTCAttentionSchedule.ONES,
+        max_guidance_weight=5.0,
+        execution_horizon=2,
+    )
+    processor = RTCProcessor(config)
+    previous = torch.tensor([[[0.1], [0.2]]])
+
+    def run(image: torch.Tensor, *, preserve_graph: bool) -> torch.Tensor:
+        latent = image + 0.2
+
+        def denoise(value: torch.Tensor) -> torch.Tensor:
+            return 0.3 * value + 0.4 * image
+
+        return processor.denoise_step(
+            latent,
+            previous,
+            inference_delay=0,
+            time=0.7,
+            original_denoise_step_partial=denoise,
+            preserve_graph=preserve_graph,
+        )
+
+    image = torch.tensor([[[0.7], [0.4]]], requires_grad=True)
+    native = run(image.detach(), preserve_graph=False)
+    replay = run(image, preserve_graph=True)
+    assert torch.allclose(native, replay, atol=1e-6, rtol=0.0)
+    gradient = torch.autograd.grad(replay.sum(), image)[0]
+
+    def scalar(value: float) -> float:
+        sample = torch.tensor([[[value], [0.4]]])
+        return float(run(sample, preserve_graph=True).sum().detach())
+
+    h = 1e-3
+    finite_difference = (scalar(0.7 + h) - scalar(0.7 - h)) / (2 * h)
+    assert gradient[0, 0, 0].item() == pytest.approx(finite_difference, abs=2e-3)
+
+
 # ====================== Helper Method Tests ======================
 
 
@@ -795,3 +840,49 @@ def test_denoise_step_deterministic_with_same_inputs():
 
     # Should produce identical results
     assert torch.allclose(result1, result2)
+
+
+@pytest.mark.parametrize("forward_time", [False, True])
+@pytest.mark.parametrize("schedule", ["uniform", "precomputed", "explicit"])
+def test_guided_multistep_replay_matches_native_values_and_finite_difference(forward_time, schedule):
+    """Replay keeps upstream time conventions and the derivative of native guided values."""
+    from lerobot.policies.common.flow_matching import FlowConvention, euler_integrate
+
+    processor = RTCProcessor(RTCConfig(execution_horizon=2, max_guidance_weight=3.0))
+    previous = torch.tensor([[[0.1], [0.2]]], dtype=torch.float64)
+    noise = torch.tensor([[[0.4], [-0.1], [0.2]]], dtype=torch.float64)
+    convention = FlowConvention.NOISE_AT_ZERO if forward_time else FlowConvention.NOISE_AT_ONE
+    grid = torch.tensor([1.0, 0.8, 0.45, 0.2, 0.0], dtype=torch.float64)
+    if forward_time:
+        grid = 1 - grid
+
+    def run(image, preserve_graph):
+        def velocity(x, time, step):
+            one_time = 1 - time if forward_time else time
+            value = 0.2 * x.sin() + 0.3 * image + 0.07 * one_time[:, None, None] + step * 0.01
+            return -value if forward_time else value
+
+        return euler_integrate(
+            velocity,
+            noise + 0.1 * image,
+            4,
+            convention=convention,
+            step_aware=True,
+            time_grid=grid if schedule == "explicit" else None,
+            precompute_times=schedule == "precomputed",
+            rtc_processor=processor,
+            rtc_enabled=True,
+            inference_delay=1,
+            prev_chunk_left_over=previous,
+            preserve_graph=preserve_graph,
+        )
+
+    image = torch.tensor(0.6, dtype=torch.float64, requires_grad=True)
+    native = run(image.detach(), False)
+    replay = run(image, True)
+    torch.testing.assert_close(replay.detach(), native.detach(), rtol=0, atol=1e-12)
+    gradient = torch.autograd.grad(replay.sum(), image)[0]
+    h = 1e-5
+    upper = run(image.detach() + h, False).sum().detach()
+    lower = run(image.detach() - h, False).sum().detach()
+    torch.testing.assert_close(gradient, (upper - lower) / (2 * h), rtol=1e-5, atol=1e-7)

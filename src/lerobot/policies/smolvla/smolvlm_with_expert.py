@@ -148,6 +148,7 @@ class SmolVLMWithExpertModel(nn.Module):
         # explainer sets it only on its own model copy, so the control-loop model can never
         # fire it. See lerobot.rollout.saliency.
         self.attention_capture: Callable[[int, torch.Tensor, str], None] | None = None
+        self.attention_step: int | None = None
 
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only

@@ -96,6 +96,37 @@ def test_validate_saliency_passes_when_disabled():
     validate_saliency(SaliencyConfig(enabled=False), SyncInferenceConfig(), "foxglove", False)
 
 
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        ("attention_layers", [], "cannot be empty"),
+        ("attention_steps", [1, 1], "duplicates"),
+        ("attention_layers", [-1], "non-negative"),
+    ],
+)
+def test_validate_saliency_rejects_invalid_attention_selectors(field, value, message):
+    from lerobot.rollout.inference import RTCInferenceConfig
+    from lerobot.rollout.saliency.config import SaliencyConfig, validate_saliency
+
+    cfg = SaliencyConfig(enabled=True, method="attention")
+    setattr(cfg, field, value)
+    with pytest.raises(ValueError, match=message):
+        validate_saliency(cfg, RTCInferenceConfig(), "rerun", True)
+
+
+def test_validate_saliency_selectors_are_attention_only():
+    from lerobot.rollout.inference import RTCInferenceConfig
+    from lerobot.rollout.saliency.config import SaliencyConfig, validate_saliency
+
+    with pytest.raises(ValueError, match="require.*attention"):
+        validate_saliency(
+            SaliencyConfig(enabled=True, method="grad_x_input", attention_steps=[0]),
+            RTCInferenceConfig(),
+            "rerun",
+            True,
+        )
+
+
 def test_rollout_config_wires_saliency_validation():
     from lerobot.rollout import RolloutConfig
     from lerobot.rollout.saliency.config import SaliencyConfig
@@ -359,7 +390,12 @@ def test_recorder_patch_kind_writes_video_with_budget(tmp_path):
         display=False,
         display_mode="rerun",
     )
-    snap = {"preprocessed": _make_fake_batch(), "noise": torch.randn(1, 10, 4), "chunk_kwargs": {}}
+    snap = {
+        "preprocessed": _make_fake_batch(),
+        "noise": torch.randn(1, 10, 4),
+        "chunk_kwargs": {},
+        "first_queued_action_index": 0,
+    }
     recorder.submit(snap)
     recorder.start()
     recorder.close()
@@ -396,7 +432,12 @@ def test_recorder_drops_nonfinite_budget_but_keeps_frame(tmp_path, caplog):
         display=False,
         display_mode="rerun",
     )
-    snap = {"preprocessed": _make_fake_batch(), "noise": torch.randn(1, 10, 4), "chunk_kwargs": {}}
+    snap = {
+        "preprocessed": _make_fake_batch(),
+        "noise": torch.randn(1, 10, 4),
+        "chunk_kwargs": {},
+        "first_queued_action_index": 0,
+    }
     with caplog.at_level(_logging.WARNING):
         _run_recorder_snapshots(recorder, [snap, snap])  # two frames: warning must not repeat
 
@@ -518,6 +559,60 @@ class _SecondCameraOnlyFlowMatching(_FakeFlowMatching):
         return first.unsqueeze(1).repeat(1, 10, 1)  # (B, chunk, action_dim)
 
 
+class _IndexedFlowMatching(_FakeFlowMatching):
+    """Give each generated action a distinct value so target-index selection is observable."""
+
+    def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None, **kwargs):
+        self.last_kwargs = {"noise": noise, **kwargs}
+        x = self.conv(images[0]).mean(dim=(2, 3))
+        first = self.head(x)
+        offsets = torch.arange(10, device=first.device, dtype=first.dtype).view(1, 10, 1)
+        return first.unsqueeze(1) + offsets
+
+
+class _FakePIModel(torch.nn.Module):
+    def __init__(self, action_dim: int = 6):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(3, 4, kernel_size=1)
+        self.head = torch.nn.Linear(4, action_dim)
+
+    @torch.no_grad()
+    def sample_actions(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        state=None,
+        states=None,
+        state_masks=None,
+        noise=None,
+        **kwargs,
+    ):
+        x = self.conv(images[0]).mean(dim=(2, 3))
+        first = self.head(x)
+        return first.unsqueeze(1).repeat(1, 4, 1)
+
+
+class _FakePIPolicy(torch.nn.Module):
+    def __init__(self, name: str):
+        super().__init__()
+        self.name = name
+        self.model = _FakePIModel()
+        self.config = SimpleNamespace(
+            image_features={CAM_KEY: object()},
+            output_features={"action": SimpleNamespace(shape=(4,))},
+            image_resolution=(32, 32),
+        )
+
+    def _preprocess_images(self, batch):
+        image = batch[CAM_KEY]
+        return [image], [torch.ones(image.shape[0], dtype=torch.bool, device=image.device)]
+
+    def prepare_state(self, batch):
+        return batch[OBS_STATE]
+
+
 def _make_fake_batch(h: int = 32, w: int = 32) -> dict:
     return {
         CAM_KEY: torch.rand(1, 3, h, w),
@@ -614,6 +709,48 @@ def test_smolvla_explainer_survives_rtc_guidance_pattern():
     assert m.shape == (32, 32)
     assert np.isfinite(m).all()
     assert m.sum() > 0  # image gradient survived the inner detached-subgraph grad
+
+
+def test_smolvla_explainer_uses_queue_target_index():
+    from lerobot.rollout.saliency import SmolVLAExplainer
+
+    policy = _FakeSmolVLAPolicy(model=_IndexedFlowMatching(4))
+    explainer = SmolVLAExplainer(policy)
+    noise = torch.randn(1, 10, 4)
+    batch = _make_fake_batch()
+    first = explainer.compute_saliency(batch, noise, {"inference_delay": 0, "target_action_index": 0})[
+        CAM_KEY
+    ]
+    delayed = explainer.compute_saliency(batch, noise, {"inference_delay": 0, "target_action_index": 4})[
+        CAM_KEY
+    ]
+
+    assert np.isfinite(first).all() and np.isfinite(delayed).all()
+    assert not np.allclose(first, delayed)
+
+
+@pytest.mark.parametrize(
+    "policy_name, explainer_name",
+    [("pi0", "PI0Explainer"), ("pi05", "PI05Explainer")],
+)
+def test_pi_grad_explainer_replays_target_and_crops_action(policy_name, explainer_name):
+    from lerobot.rollout.saliency import PI0Explainer, PI05Explainer
+
+    policy = _FakePIPolicy(policy_name)
+    explainer = {"PI0Explainer": PI0Explainer, "PI05Explainer": PI05Explainer}[explainer_name](policy)
+    batch = _make_fake_batch(h=16, w=20)
+    before = {key: value.clone() for key, value in batch.items()}
+    maps = explainer.compute_saliency(
+        batch,
+        torch.randn(1, 4, 6),
+        {"inference_delay": 0, "target_action_index": 2},
+    )
+
+    assert set(maps) == {CAM_KEY}
+    assert maps[CAM_KEY].shape == (16, 20)
+    assert np.isfinite(maps[CAM_KEY]).all()
+    for key, value in before.items():
+        assert torch.equal(batch[key], value)
 
 
 def test_smolvla_explainer_zero_map_for_inert_camera():
@@ -818,6 +955,10 @@ class _ScriptedVLM:
 
     def __init__(self):
         self.attention_capture = None
+        self.attention_step = None
+        self.num_vlm_layers = 2
+        self.num_expert_layers = 2
+        self.self_attn_every_n_layers = 2
 
 
 class _ScriptedAttentionFlowMatching(_FakeFlowMatching):
@@ -827,10 +968,15 @@ class _ScriptedAttentionFlowMatching(_FakeFlowMatching):
         super().__init__(action_dim)
         self.vlm_with_expert = vlm
         self._script = script
+        self._attention_num_steps = max(1, sum(kind == "cross" for _, _, kind in script))
 
     def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None, **kwargs):
+        step = 0
         for layer_idx, probs, kind in self._script:
+            self.vlm_with_expert.attention_step = step if kind == "cross" else None
             self.vlm_with_expert.attention_capture(layer_idx, probs, kind)
+            if kind == "cross":
+                step += 1
         return super().sample_actions(images, img_masks, lang_tokens, lang_masks, state, noise=noise)
 
 
@@ -942,7 +1088,7 @@ def test_attention_explainer_consumes_only_cross_events_and_averages():
 
     maps = explainer.compute_saliency(_make_fake_batch(), torch.randn(1, 10, 4), dict(_CHUNK_KWARGS))
 
-    assert explainer._events == 2  # 4 self events were filtered out
+    assert len(explainer._accumulator.seen) == 2  # 4 self events were filtered out
     assert np.allclose(maps[CAM_KEY], 0.5 / 64)  # mean of the two cross events
     budget = explainer.last_budget
     assert budget[CAM_KEY] == pytest.approx(0.5, abs=1e-6)
@@ -986,7 +1132,7 @@ def test_attention_explainer_raises_without_cross_events():
 
     policy, _ = _make_attention_policy([])  # tap never fires
     explainer = SmolVLAAttentionExplainer(policy)
-    with pytest.raises(RuntimeError, match="No cross-attention events"):
+    with pytest.raises(RuntimeError, match="No selected attention events"):
         explainer.compute_saliency(_make_fake_batch(), torch.randn(1, 10, 4), dict(_CHUNK_KWARGS))
 
 
@@ -1008,6 +1154,146 @@ def test_attention_explainer_close_detaches_tap():
     explainer.close()
     assert vlm.attention_capture is None
     explainer.close()  # idempotent
+
+
+def test_pi_attention_accumulates_selected_layer_step_events_only():
+    from lerobot.rollout.saliency.attention import AttentionAccumulator
+    from lerobot.rollout.saliency.pi_attention import PI05AttentionExplainer
+
+    model = SimpleNamespace(attention_capture=None, attention_step=None)
+    policy = SimpleNamespace(model=model)
+    explainer = PI05AttentionExplainer(policy)
+    explainer._accumulator = AttentionAccumulator({2}, {1})
+    explainer._query_index = 1
+    explainer._query_count = 3
+    explainer._key_count = 5
+
+    first = torch.zeros(1, 2, 3, 5)
+    first[0, :, 1, 2] = 1.0
+    second = torch.zeros(1, 2, 3, 5)
+    second[0, :, 1, 4] = 1.0
+    explainer._on_attention(1, 1, first)  # filtered layer
+    explainer._on_attention(2, 0, first)  # filtered step
+    explainer._on_attention(2, 1, first.to(torch.bfloat16))
+    assert len(explainer._accumulator.seen) == 1
+    result = explainer._accumulator.mean(range(3), 2)
+    assert result.dtype == torch.float32
+    assert torch.equal(result, first[0, :, 1, :].mean(dim=0))
+
+    with pytest.raises(RuntimeError, match="Duplicate attention event"):
+        explainer._on_attention(2, 1, second)
+    explainer.close()
+    assert model.attention_capture is None
+
+
+def test_pi_attention_patch_grid_supports_non_square_resolution():
+    from lerobot.rollout.saliency.pi_attention import _PIAttentionExplainer
+
+    policy = SimpleNamespace(
+        config=SimpleNamespace(image_resolution=(224, 280)),
+        model=SimpleNamespace(
+            paligemma_with_expert=SimpleNamespace(
+                paligemma=SimpleNamespace(
+                    model=SimpleNamespace(vision_tower=SimpleNamespace(config=SimpleNamespace(patch_size=14)))
+                )
+            )
+        ),
+    )
+    assert _PIAttentionExplainer._patch_grid(policy) == (320, 16, 20)
+
+
+@pytest.mark.parametrize("layers,steps", [(None, None), ([1], [0]), ([1, 3], [0, 2])])
+def test_attention_accumulator_independent_selection_and_shared_events(layers, steps):
+    from lerobot.rollout.saliency.attention import AttentionAccumulator
+
+    selected = AttentionAccumulator(layers, steps)
+    all_events = AttentionAccumulator()
+    expected = []
+    for layer in (1, 3):
+        for step in range(3):
+            row = torch.tensor([layer, step], dtype=torch.bfloat16)
+            selected.add(layer, step, row)
+            all_events.add(layer, step, row)  # same event, no extra model evaluation
+            if (layers is None or layer in layers) and (steps is None or step in steps):
+                expected.append(row.float())
+    torch.testing.assert_close(selected.mean([1, 3], 3), torch.stack(expected).mean(0))
+    torch.testing.assert_close(all_events.mean([1, 3], 3), torch.tensor([2.0, 1.0]))
+
+
+def test_attention_accumulator_rejects_missing_duplicate_and_changed_layout():
+    from lerobot.rollout.saliency.attention import AttentionAccumulator
+
+    accumulator = AttentionAccumulator()
+    row = torch.ones(4)
+    with pytest.raises(RuntimeError, match="step identity"):
+        accumulator.add(1, None, row)
+    accumulator.add(1, 0, row)
+    with pytest.raises(RuntimeError, match="Duplicate"):
+        accumulator.add(1, 0, row)
+    with pytest.raises(RuntimeError, match="layout changed"):
+        accumulator.add(1, 1, torch.ones(5))
+    with pytest.raises(RuntimeError, match="event set mismatch"):
+        accumulator.mean([1], 2)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_smol_attention_rejects_unknown_steps_even_when_selecting_all(explicit):
+    from lerobot.rollout.saliency import SmolVLAAttentionExplainer
+    from lerobot.rollout.saliency.attention import AttentionAccumulator
+
+    policy, vlm = _make_attention_policy([])
+    explainer = SmolVLAAttentionExplainer(policy)
+    explainer._accumulator = AttentionAccumulator([1], [0]) if explicit else AttentionAccumulator()
+    vlm.attention_step = None
+    with pytest.raises(RuntimeError, match="step identity"):
+        explainer._on_attention(1, torch.ones(1, 2, 3, 69), "cross")
+    explainer.close()
+
+
+def test_smol_attention_rejects_incomplete_default_replay():
+    from lerobot.rollout.saliency import SmolVLAAttentionExplainer
+
+    policy, _ = _make_attention_policy([(1, _probs(np.full(69, 1 / 69)), "cross")])
+    policy.model._attention_num_steps = 2
+    explainer = SmolVLAAttentionExplainer(policy)
+    with pytest.raises(RuntimeError, match="event set mismatch"):
+        explainer.compute_saliency(_make_fake_batch(), torch.randn(1, 10, 4), _CHUNK_KWARGS)
+    explainer.close()
+
+
+@pytest.mark.parametrize("queries,keys", [(2, 5), (3, 4), (3, 6)])
+def test_pi_attention_rejects_actual_key_query_layout_mismatch(queries, keys):
+    from lerobot.rollout.saliency.pi_attention import PI05AttentionExplainer
+
+    explainer = PI05AttentionExplainer(SimpleNamespace(model=SimpleNamespace()))
+    explainer._query_count, explainer._key_count = 3, 5
+    with pytest.raises(RuntimeError, match="key/query layout mismatch"):
+        explainer._on_attention(0, 0, torch.ones(1, 2, queries, keys))
+    explainer.close()
+
+
+def test_pi_attention_layout_uses_real_camera_order_with_missing_placeholder():
+    from lerobot.rollout.saliency.pi_attention import _PIAttentionExplainer
+
+    cam1, cam2 = "observation.images.cam1", "observation.images.cam2"
+    policy = SimpleNamespace(
+        config=SimpleNamespace(image_features={cam1: object(), cam2: object()}, image_resolution=(28, 28)),
+        model=SimpleNamespace(
+            paligemma_with_expert=SimpleNamespace(
+                paligemma=SimpleNamespace(
+                    model=SimpleNamespace(vision_tower=SimpleNamespace(config=SimpleNamespace(patch_size=14)))
+                )
+            )
+        ),
+    )
+    explainer = object.__new__(_PIAttentionExplainer)
+    explainer.policy = policy
+    slots, tokens, grid_h, grid_w, lang_len = explainer._layout(
+        {cam2: torch.zeros(1), OBS_LANGUAGE_TOKENS: torch.zeros(1, 3, dtype=torch.long)},
+        [torch.zeros(1), torch.zeros(1)],
+    )
+    assert slots == [(cam2, 0)]
+    assert (tokens, grid_h, grid_w, lang_len) == (4, 2, 2, 3)
 
 
 def test_smolvla_attention_explainer_replays_real_policy():
@@ -1149,13 +1435,22 @@ def test_recorder_drops_stale_snapshots_and_writes_video(tmp_path):
         display=False,
         display_mode="rerun",
     )
-    snap = {"preprocessed": _make_fake_batch(), "noise": torch.randn(1, 10, 4), "chunk_kwargs": {}}
+    snap = {
+        "preprocessed": _make_fake_batch(),
+        "noise": torch.randn(1, 10, 4),
+        "chunk_kwargs": {},
+        "first_queued_action_index": 0,
+    }
     recorder.submit(snap)
     recorder.submit(snap)  # queue cap 1: first submission must be dropped
+    assert recorder._submitted == 2
+    assert recorder._queue_dropped == 1
     recorder.start()
     recorder.close()
 
     assert explainer.calls == 1
+    assert recorder._processed == 1
+    assert recorder._failed == 0
     video = out / "cam1.mp4"  # filename = last path segment of the camera key
     assert video.exists() and video.stat().st_size > 0
     cap = cv2.VideoCapture(str(video))
@@ -1207,7 +1502,12 @@ def test_recorder_survives_sentinel_steal_race(tmp_path):
         display=False,
         display_mode="rerun",
     )
-    snap = {"preprocessed": _make_fake_batch(), "noise": torch.randn(1, 10, 4), "chunk_kwargs": {}}
+    snap = {
+        "preprocessed": _make_fake_batch(),
+        "noise": torch.randn(1, 10, 4),
+        "chunk_kwargs": {},
+        "first_queued_action_index": 0,
+    }
     recorder.start()
     recorder.submit(snap)  # thread picks this up; the slow explainer keeps it busy
     assert explainer.started.wait(timeout=5.0)  # slow compute is running when close() lands
@@ -1255,7 +1555,12 @@ def test_recorder_drops_non_finite_saliency_and_warns_once(tmp_path, caplog):
         display=False,
         display_mode="rerun",
     )
-    snap = {"preprocessed": _make_fake_batch(), "noise": torch.randn(1, 10, 4), "chunk_kwargs": {}}
+    snap = {
+        "preprocessed": _make_fake_batch(),
+        "noise": torch.randn(1, 10, 4),
+        "chunk_kwargs": {},
+        "first_queued_action_index": 0,
+    }
     recorder.start()
     with caplog.at_level("WARNING", logger="lerobot.rollout.saliency.recorder"):
         for processed in (1, 2):
@@ -1321,7 +1626,115 @@ def _make_recorder(tmp_path, explainer, **kwargs):
 
 
 def _snapshot() -> dict:
-    return {"preprocessed": _make_fake_batch(), "noise": torch.randn(1, 10, 4), "chunk_kwargs": {}}
+    return {
+        "preprocessed": _make_fake_batch(),
+        "noise": torch.randn(1, 10, 4),
+        "chunk_kwargs": {},
+        "first_queued_action_index": 0,
+    }
+
+
+@pytest.mark.parametrize("invalidation", ["epoch", "revision"])
+@pytest.mark.parametrize("stage", ["compute", "render", "writer"])
+def test_recorder_drops_snapshots_invalidated_before_publication(tmp_path, monkeypatch, invalidation, stage):
+    from lerobot.rollout.saliency import recorder as module
+
+    recorder = _make_recorder(tmp_path, _SequenceExplainer([1.0]))
+    recorder._display = True
+    current = {"revision": 0}
+    recorder.set_view_mask(
+        SimpleNamespace(
+            controller=SimpleNamespace(is_current=lambda revision: revision == current["revision"])
+        )
+    )
+    snapshot = _snapshot()
+    snapshot.update(accepted_epoch=0, view_mask=SimpleNamespace(revision=0, masked_views=frozenset()))
+
+    def invalidate():
+        if invalidation == "epoch":
+            recorder.set_reset_epoch(1)
+        else:
+            current["revision"] = 1
+
+    compute = recorder._explainer.compute_saliency
+
+    def compute_and_invalidate(*args):
+        result = compute(*args)
+        invalidate()
+        return result
+
+    if stage == "compute":
+        monkeypatch.setattr(recorder._explainer, "compute_saliency", compute_and_invalidate)
+    render = module.render_overlay
+
+    def render_and_invalidate(*args, **kwargs):
+        result = render(*args, **kwargs)
+        if stage == "render":
+            invalidate()
+        return result
+
+    monkeypatch.setattr(module, "render_overlay", render_and_invalidate)
+
+    def writer(*args):
+        if stage == "writer":
+            invalidate()
+        return SimpleNamespace(write=lambda frame: pytest.fail("stale video published"))
+
+    monkeypatch.setattr(recorder, "_writer", writer)
+    monkeypatch.setattr(module, "log_rerun_saliency", lambda frames: pytest.fail("stale Rerun published"))
+    monkeypatch.setattr(
+        module, "log_rerun_saliency_budget", lambda budget: pytest.fail("stale budget published")
+    )
+    assert recorder._process(snapshot) is False
+    assert recorder._stale_dropped == 1
+    assert recorder._failed == 0
+    assert recorder._norm_hi == 0
+
+
+@pytest.mark.parametrize("stage", ["last_render", "first_write", "rerun"])
+def test_recorder_stops_remaining_sinks_after_reset(tmp_path, monkeypatch, stage):
+    from lerobot.rollout.saliency import recorder as module
+
+    maps = {CAM_KEY: np.ones((8, 8), np.float32), CAM_KEY_2: np.ones((8, 8), np.float32)}
+    explainer = SimpleNamespace(
+        map_kind="patch",
+        last_budget={CAM_KEY: 0.5, CAM_KEY_2: 0.5},
+        compute_saliency=lambda *args: maps,
+    )
+    recorder = _make_recorder(tmp_path, explainer)
+    recorder._display = True
+    snapshot = _snapshot()
+    snapshot["accepted_epoch"] = 0
+    snapshot["preprocessed"][CAM_KEY_2] = snapshot["preprocessed"][CAM_KEY].clone()
+    renders, writes, reruns = [], [], []
+
+    def render(frame, *args, **kwargs):
+        renders.append(1)
+        if stage == "last_render" and len(renders) == 2:
+            recorder.set_reset_epoch(1)
+        return frame
+
+    def write(frame):
+        writes.append(1)
+        if stage == "first_write":
+            recorder.set_reset_epoch(1)
+
+    def log_frames(frames):
+        reruns.append(1)
+        if stage == "rerun":
+            recorder.set_reset_epoch(1)
+
+    monkeypatch.setattr(module, "render_patch_overlay", render)
+    monkeypatch.setattr(module, "draw_budget_bar", lambda frame, budget: frame)
+    monkeypatch.setattr(recorder, "_writer", lambda *args: SimpleNamespace(write=write))
+    monkeypatch.setattr(module, "log_rerun_saliency", log_frames)
+    monkeypatch.setattr(module, "log_rerun_saliency_budget", lambda budget: pytest.fail("stale budget"))
+    assert recorder._process(snapshot) is False
+    assert len(renders) == 2
+    assert len(writes) == {"last_render": 0, "first_write": 1, "rerun": 2}[stage]
+    assert len(reruns) == int(stage == "rerun")
+    assert recorder._stale_dropped == 1
+    assert recorder._failed == 0
 
 
 class _FlakyExplainer:
@@ -1362,7 +1775,12 @@ def test_recorder_survives_single_frame_failure(tmp_path):
         display=False,
         display_mode="rerun",
     )
-    snap = {"preprocessed": _make_fake_batch(), "noise": torch.randn(1, 10, 4), "chunk_kwargs": {}}
+    snap = {
+        "preprocessed": _make_fake_batch(),
+        "noise": torch.randn(1, 10, 4),
+        "chunk_kwargs": {},
+        "first_queued_action_index": 0,
+    }
     _run_recorder_snapshots(recorder, [snap, snap])
 
     assert explainer.calls == 2
@@ -1385,13 +1803,26 @@ def test_recorder_disables_after_consecutive_failures(tmp_path, caplog):
         display=False,
         display_mode="rerun",
     )
-    snap = {"preprocessed": _make_fake_batch(), "noise": torch.randn(1, 10, 4), "chunk_kwargs": {}}
+    snap = {
+        "preprocessed": _make_fake_batch(),
+        "noise": torch.randn(1, 10, 4),
+        "chunk_kwargs": {},
+        "first_queued_action_index": 0,
+    }
     with caplog.at_level(_logging.ERROR):
         _run_recorder_snapshots(recorder, [snap, snap, snap])
 
     assert explainer.calls == 2  # the third snapshot was never processed
     assert any("Disabling saliency recording" in r.message for r in caplog.records)
     assert not recorder._thread.is_alive()
+
+
+def test_recorder_rejects_snapshot_without_queue_target(tmp_path):
+    recorder = _make_recorder(tmp_path, _FixedExplainer())
+    with pytest.raises(ValueError, match="missing first_queued_action_index"):
+        recorder._process(
+            {"preprocessed": _make_fake_batch(), "noise": torch.randn(1, 10, 4), "chunk_kwargs": {}}
+        )
 
 
 def test_recorder_shares_norm_range_across_cameras(tmp_path, monkeypatch):
@@ -1407,7 +1838,14 @@ def test_recorder_shares_norm_range_across_cameras(tmp_path, monkeypatch):
 
     recorder = _make_recorder(tmp_path, _TwoScaleExplainer())
     batch = _make_fake_batch() | {CAM_KEY_2: torch.rand(1, 3, 32, 32)}
-    recorder._process({"preprocessed": batch, "noise": torch.randn(1, 10, 4), "chunk_kwargs": {}})
+    recorder._process(
+        {
+            "preprocessed": batch,
+            "noise": torch.randn(1, 10, 4),
+            "chunk_kwargs": {},
+            "first_queued_action_index": 0,
+        }
+    )
 
     assert len(seen) == 2  # one render call per camera
     assert seen[0] is seen[1]  # literally the same shared range object
@@ -1469,7 +1907,15 @@ def test_build_saliency_snapshot_clones_tensors():
     prev = torch.rand(4, 4)
     preprocessed = {CAM_KEY: imgs, "task": ["pick"]}
 
-    snap = _build_saliency_snapshot(preprocessed, noise=noise, inference_delay=3, prev_chunk_left_over=prev)
+    snap = _build_saliency_snapshot(
+        preprocessed,
+        noise=noise,
+        inference_delay=3,
+        prev_chunk_left_over=prev,
+        reset_epoch=4,
+        chunk_id=9,
+        observation_time=12.5,
+    )
 
     assert snap["preprocessed"][CAM_KEY] is not imgs
     assert snap["preprocessed"]["task"] == ["pick"]
@@ -1477,6 +1923,9 @@ def test_build_saliency_snapshot_clones_tensors():
     assert torch.equal(snap["noise"], noise)
     assert snap["chunk_kwargs"]["inference_delay"] == 3
     assert torch.equal(snap["chunk_kwargs"]["prev_chunk_left_over"], prev)
+    assert snap["reset_epoch"] == 4
+    assert snap["chunk_id"] == 9
+    assert snap["observation_time"] == pytest.approx(12.5)
     snap["noise"].zero_()
     assert not torch.allclose(noise, torch.zeros_like(noise))  # deep copy, not a view
 
@@ -1616,3 +2065,31 @@ def test_saliency_manager_attention_requires_letterboxed_images(monkeypatch, tmp
     policy_config = SimpleNamespace(type="smolvla", input_features={}, resize_imgs_with_padding=None)
     with pytest.raises(ValueError, match="resize_imgs_with_padding"):
         mgr.SaliencyManager(cfg, policy_config, policy_device="cpu", display_mode="rerun", load_policy=_load)
+
+
+@pytest.mark.parametrize("memory_field", ["use_visual_memory", "use_proprioceptive_memory"])
+def test_saliency_manager_rejects_pi05_memory_before_loading(monkeypatch, tmp_path, memory_field):
+    import lerobot.rollout.saliency.manager as mgr
+
+    monkeypatch.setattr(mgr, "get_explainer_cls", lambda *args, **kwargs: object)
+    cfg = SimpleNamespace(
+        enabled=True,
+        device=None,
+        output_dir=str(tmp_path),
+        video_fps=10.0,
+        alpha=0.5,
+        blur_sigma=2.0,
+        display=False,
+        method="grad_x_input",
+        norm_scope="run",
+    )
+    policy_config = SimpleNamespace(type="pi05", **{memory_field: True})
+
+    with pytest.raises(ValueError, match="does not support MEM"):
+        mgr.SaliencyManager(
+            cfg,
+            policy_config,
+            policy_device="cpu",
+            display_mode="rerun",
+            load_policy=lambda: pytest.fail("MEM must be rejected before loading"),
+        )

@@ -19,6 +19,7 @@ import logging
 import os
 import queue
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -50,15 +51,12 @@ def _masked_views(view_mask_snapshot) -> frozenset[str]:
 
 
 def _budget_segments(budget: dict[str, float]) -> list[tuple[str, float]]:
-    """Order a five-way attention budget for the stacked bar: cameras first (insertion order,
-    short display names), then language, then state."""
-    segments = [
-        (key.rsplit(".", 1)[-1], share) for key, share in budget.items() if key not in ("language", "state")
-    ]
-    if "language" in budget:
-        segments.append(("language", budget["language"]))
-    if "state" in budget:
-        segments.append(("state", budget["state"]))
+    """Order cameras first, followed by architecture-specific prompt/state/action groups."""
+    special = ("language", "state", "prompt", "action")
+    segments = [(key.rsplit(".", 1)[-1], share) for key, share in budget.items() if key not in special]
+    for key in special:
+        if key in budget:
+            segments.append((key, budget[key]))
     return segments
 
 
@@ -92,7 +90,14 @@ class SaliencyRecorder:
         # been superseded is filtered out below — as provenance filtering, NOT as a
         # failure, so it never counts toward the consecutive-failure downgrade.
         self._view_mask = None
+        self._reset_epoch = 0
         self._stale_dropped = 0
+        self._submitted = 0
+        self._queue_dropped = 0
+        self._processed = 0
+        self._failed = 0
+        self._processing_total_s = 0.0
+        self._processing_max_s = 0.0
         self._queue: queue.Queue = queue.Queue(maxsize=1)
         self._thread: threading.Thread | None = None
         self._writers: dict[str, object] = {}
@@ -113,6 +118,10 @@ class SaliencyRecorder:
         """
         self._view_mask = runtime
 
+    def set_reset_epoch(self, epoch: int) -> None:
+        """Invalidate snapshots accepted before a control reset."""
+        self._reset_epoch = int(epoch)
+
     def submit(self, snapshot: dict | None) -> None:
         """Non-blocking, drop-oldest push. ``None`` is the shutdown sentinel."""
         if snapshot is not None and self._view_mask is not None:
@@ -132,9 +141,15 @@ class SaliencyRecorder:
             self._queue.put_nowait(snapshot)
         except queue.Full:
             with contextlib.suppress(queue.Empty):
-                self._queue.get_nowait()
-            with contextlib.suppress(queue.Full):
+                evicted = self._queue.get_nowait()
+                if evicted is not None:
+                    self._queue_dropped += 1
+            try:
                 self._queue.put_nowait(snapshot)
+            except queue.Full:
+                return
+        if snapshot is not None:
+            self._submitted += 1
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="saliency-recorder", daemon=True)
@@ -171,10 +186,13 @@ class SaliencyRecorder:
                     # between submit() and this pop.
                     self._stale_dropped += 1
                     continue
+                started = time.perf_counter()
                 try:
-                    self._process(item)
+                    if self._process(item) is not False:
+                        self._processed += 1
                     consecutive_failures = 0
                 except Exception:
+                    self._failed += 1
                     consecutive_failures += 1
                     logger.exception("Saliency frame dropped due to processing error")
                     if consecutive_failures >= 2:
@@ -182,14 +200,32 @@ class SaliencyRecorder:
                         # not transient load: stop rather than silently producing an empty video.
                         logger.error("Disabling saliency recording after repeated frame failures")
                         break
+                finally:
+                    elapsed = time.perf_counter() - started
+                    self._processing_total_s += elapsed
+                    self._processing_max_s = max(self._processing_max_s, elapsed)
         finally:
             # Writers are released here, on the recorder thread, so the main thread
             # never releases a writer the thread might still be writing to.
             for writer in self._writers.values():
                 writer.release()
+            attempts = self._processed + self._failed
+            logger.info(
+                "Saliency recorder summary: submitted=%d processed=%d queue_dropped=%d "
+                "stale_dropped=%d failed=%d process_mean_ms=%.1f process_max_ms=%.1f",
+                self._submitted,
+                self._processed,
+                self._queue_dropped,
+                self._stale_dropped,
+                self._failed,
+                1000 * self._processing_total_s / attempts if attempts else 0.0,
+                1000 * self._processing_max_s,
+            )
 
     def _is_stale(self, item: dict) -> bool:
         """Whether a snapshot's View Mask revision has been superseded since it was queued."""
+        if item.get("accepted_epoch") is not None and item["accepted_epoch"] != self._reset_epoch:
+            return True
         if self._view_mask is None:
             return False
         mask = item.get("view_mask")
@@ -197,8 +233,25 @@ class SaliencyRecorder:
             return False
         return not self._view_mask.controller.is_current(mask.revision)
 
-    def _process(self, item: dict) -> None:
-        maps = self._explainer.compute_saliency(item["preprocessed"], item["noise"], item["chunk_kwargs"])
+    def _drop_if_stale(self, item: dict) -> bool:
+        if not self._is_stale(item):
+            return False
+        self._stale_dropped += 1
+        return True
+
+    def _process(self, item: dict) -> bool | None:
+        if self._drop_if_stale(item):
+            return False
+        chunk_kwargs = dict(item["chunk_kwargs"])
+        target_index = item.get("first_queued_action_index")
+        if target_index is None:
+            raise ValueError(
+                "Saliency snapshot is missing first_queued_action_index; refusing to silently explain a[0]"
+            )
+        chunk_kwargs["target_action_index"] = int(target_index)
+        maps = self._explainer.compute_saliency(item["preprocessed"], item["noise"], chunk_kwargs)
+        if self._drop_if_stale(item):
+            return False
         # Patch explainers also expose a five-way attention budget (same thread — no race).
         budget = getattr(self._explainer, "last_budget", None) if self._map_kind == "patch" else None
         if budget is not None and not all(np.isfinite(v) for v in budget.values()):
@@ -238,8 +291,7 @@ class SaliencyRecorder:
             # hi = decaying running max. Color depth ≈ absolute contribution, comparable across
             # cameras AND time — a quiet moment stays dark instead of being stretched to red.
             chunk_hi = max(float(m.max()) for _, _, m in prepared)
-            self._norm_hi = max(chunk_hi, self._norm_hi * _NORM_HI_DECAY)
-            norm_range = (0.0, self._norm_hi)
+            norm_range = (0.0, max(chunk_hi, self._norm_hi * _NORM_HI_DECAY))
         else:
             # "chunk" scope: all cameras of one chunk share one color scale (per-chunk min-max);
             # a camera that contributed little stays dark instead of being stretched to full
@@ -248,6 +300,7 @@ class SaliencyRecorder:
         budget_segments = _budget_segments(budget) if budget is not None else None
         masked_views = _masked_views(item.get("view_mask"))
         rerun_frames: dict[str, np.ndarray] = {}
+        overlays: list[tuple[str, np.ndarray]] = []
         for cam_key, frame, display_map in prepared:
             if self._map_kind == "patch":
                 overlay = render_patch_overlay(
@@ -259,20 +312,61 @@ class SaliencyRecorder:
                 overlay = render_overlay(
                     frame, display_map, self._alpha, blur_sigma=0.0, norm_range=norm_range
                 )
+            target_label = item.get("first_queued_action_index", 0)
+            if self._map_kind == "patch":
+                layers = getattr(self._explainer, "attention_layers", None)
+                steps = getattr(self._explainer, "attention_steps", None)
+                layer_label = "all" if layers is None else ",".join(str(v) for v in layers)
+                step_label = "all" if steps is None else ",".join(str(v) for v in steps)
+                label = (
+                    f"a[{target_label}]  layers={layer_label} steps={step_label} mean "
+                    f"obs={item.get('chunk_id', '?')} epoch={item.get('accepted_epoch', '?')}"
+                )
+            else:
+                label = f"a[{target_label}]  chunk={item.get('chunk_id', '?')}"
+            cv2.putText(
+                overlay,
+                label,
+                (8, max(18, overlay.shape[0] - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
             if cam_key in masked_views:
                 overlay = draw_masked_badge(overlay)
+            overlays.append((cam_key, overlay))
+            if self._display and self._display_mode == "rerun":
+                rerun_frames[cam_key.rsplit(".", 1)[-1]] = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+
+        # Render every camera before publishing any of them. Reset/revision changes
+        # during GPU transfer, rendering or writer startup must not publish old maps.
+        # Never hold a control-thread lock across codec or Rerun I/O. Each sink's
+        # final check is its publication boundary; an already-started write cannot
+        # be retracted if a reset arrives while that external sink is writing.
+        if self._drop_if_stale(item):
+            return False
+        for cam_key, overlay in overlays:
+            writer = self._writer(cam_key, overlay.shape[1], overlay.shape[0])
+            if self._drop_if_stale(item):
+                return False
             # Some OpenCV builds return a bool from write(), None on others; a False means the
             # frame was silently dropped (e.g. resolution changed mid-video → frozen mp4).
-            ret = self._writer(cam_key, overlay.shape[1], overlay.shape[0]).write(overlay)
+            ret = writer.write(overlay)
             if ret is False and cam_key not in self._write_warned:
                 self._write_warned.add(cam_key)
                 logger.warning("Video writer rejected the frame for %s (resolution changed?)", cam_key)
-            if self._display and self._display_mode == "rerun":
-                rerun_frames[cam_key.rsplit(".", 1)[-1]] = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
         if rerun_frames:
+            if self._drop_if_stale(item):
+                return False
             log_rerun_saliency(rerun_frames)
         if self._display and self._display_mode == "rerun" and budget is not None:
+            if self._drop_if_stale(item):
+                return False
             log_rerun_saliency_budget({k.rsplit(".", 1)[-1]: v for k, v in budget.items()})
+        if self._norm_scope == "run":
+            self._norm_hi = norm_range[1]
 
     def _writer(self, cam_key: str, width: int, height: int):
         if cam_key in self._writers:

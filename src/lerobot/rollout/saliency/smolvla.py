@@ -5,16 +5,12 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""SmolVLA Explainer: gradient replay of the executed action chunk (gradients × input).
+"""SmolVLA gradient×input replay of the first action retained by RTC (a_d).
 
-Mirrors the call sequence of ``SmolVLAPolicy.predict_action_chunk`` → ``_get_chunk``
-(src/lerobot/policies/smolvla/modeling_smolvla.py:195-241) but with the image inputs
-marked ``requires_grad``. Passing the same ``noise`` + same batch + same chunk kwargs
-reproduces the executed chunk deterministically (RTCProcessor holds no output-affecting state
-(only an optional debug tracker), n_obs_steps=1; across GPU models FP kernels may differ at
-ulp level — imperceptible for saliency),
-so the gradient explains the action that was actually executed. Params stay frozen:
-we differentiate wrt the input pixels only.
+The sidecar reuses the accepted chunk's batch, noise and generation conditions;
+it never sends the replayed actions to the robot. Parameters stay frozen and only
+image inputs are differentiated. Replay equivalence is tested with path-specific
+tolerances, not assumed bitwise across devices. Queued does not mean executed.
 """
 
 from __future__ import annotations
@@ -48,7 +44,7 @@ class SmolVLAExplainer(Explainer):
         if noise is None:
             raise ValueError(
                 "Saliency replay requires the injected noise tensor (snapshot came from an engine "
-                "without noise injection); exact replay of the executed chunk is impossible"
+                "without noise injection); replay of the accepted chunk is impossible"
             )
         policy.eval()
         device = next(policy.parameters()).device
@@ -80,16 +76,26 @@ class SmolVLAExplainer(Explainer):
             lang_tokens = batch[OBS_LANGUAGE_TOKENS]
             lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
 
-            actions = policy.model.sample_actions(
-                images, img_masks, lang_tokens, lang_masks, state, noise=noise, **chunk_kwargs
-            )
+            policy.model._saliency_preserve_graph = True
+            try:
+                actions = policy.model.sample_actions(
+                    images, img_masks, lang_tokens, lang_masks, state, noise=noise, **chunk_kwargs
+                )
+            finally:
+                policy.model._saliency_preserve_graph = False
             actions = actions[:, :, : policy.config.action_feature.shape[0]]
             if policy.config.adapt_to_pi_aloha:
                 actions = policy._pi_aloha_encode_actions(actions)
 
-            # Backward target: squared L2 of the first executed action (batch is always 1 at
-            # rollout). Same pixel map as the L2 norm up to a scalar that min-max removes.
-            score = actions[0, 0].pow(2).sum()
+            target_index = int(chunk_kwargs.get("target_action_index", 0))
+            if not 0 <= target_index < actions.shape[1]:
+                raise ValueError(
+                    f"target_action_index={target_index} is outside the generated chunk "
+                    f"of length {actions.shape[1]}"
+                )
+            # Target the action retained at the queue's actual index.
+            # Same pixel map as the L2 norm up to a scalar that min-max removes.
+            score = actions[0, target_index].pow(2).sum()
             # allow_unused=True: a camera that didn't influence the action yields grad=None
             # instead of a RuntimeError (with the default False it raises, never returns None).
             grads = torch.autograd.grad(score, [batch[k] for k in img_keys], allow_unused=True)

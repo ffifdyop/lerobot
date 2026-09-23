@@ -270,6 +270,7 @@ def euler_integrate(
     hard_prefix: Tensor | None = None,
     hard_prefix_mask: Tensor | None = None,
     precompute_times: bool = False,
+    preserve_graph: bool = False,
 ) -> Tensor:
     """Forward-Euler integration of a flow-matching velocity field between noise and actions.
 
@@ -315,6 +316,8 @@ def euler_integrate(
         precompute_times: Create the float32 timestep schedule on the target device once,
             avoiding a scalar tensor allocation/host transfer in each denoising step.
             Uses the same Python scalar arithmetic as the historical loop.
+        preserve_graph: Retain the outer latent/input graph for saliency replay of guided
+            RTC. False preserves the ordinary detached RTC path and its call signature.
     """
     bsize = noise.shape[0]
     device = noise.device
@@ -392,6 +395,7 @@ def euler_integrate(
             rtc_time = host_time if noise_at_one else 1.0 - host_time
 
         if guidance is not None:
+            rtc_kwargs = {"preserve_graph": True} if preserve_graph else {}
             v_t = guidance.denoise_step(
                 x_t=x_t,
                 prev_chunk_left_over=prev_chunk_left_over,
@@ -401,6 +405,7 @@ def euler_integrate(
                     denoise_step_partial_call if noise_at_one else flipped_denoise_step_partial_call
                 ),
                 execution_horizon=execution_horizon,
+                **rtc_kwargs,
             )
             if not noise_at_one:
                 v_t = -v_t
