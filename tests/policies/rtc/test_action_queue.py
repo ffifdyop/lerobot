@@ -365,6 +365,22 @@ def test_merge_with_large_delay(action_queue_rtc_enabled, sample_actions):
     assert action_queue_rtc_enabled.qsize() == 0
 
 
+def test_merge_returns_actual_target_index_and_nonempty_state(action_queue_rtc_enabled, sample_actions):
+    result = action_queue_rtc_enabled.merge(
+        sample_actions["original"], sample_actions["processed"], real_delay=7
+    )
+
+    assert result.first_queued_action_index == 7
+    assert result.has_actions is True
+    assert result.accepted is True
+
+    empty = action_queue_rtc_enabled.merge(
+        sample_actions["short"], sample_actions["short"], real_delay=100
+    )
+    assert empty.first_queued_action_index == 10  # clamped, never fabricated as a valid target
+    assert empty.has_actions is False
+
+
 # merge() with RTC disabled tests
 
 

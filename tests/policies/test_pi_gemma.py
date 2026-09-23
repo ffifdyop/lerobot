@@ -115,3 +115,26 @@ def test_pi_gemma_decoder_layer_accepts_both_cond_shapes(cond_shape):
     out = out[0] if isinstance(out, tuple) else out
 
     assert out.shape == (BATCH, TOKENS, HIDDEN)
+
+
+def test_pi_gemma_decoder_layer_emits_instance_attention_event():
+    layer = _decoder_layer()
+    hidden = torch.randn(1, TOKENS, HIDDEN)
+    events = []
+
+    out = layer(
+        hidden,
+        attention_mask=torch.zeros(1, 1, TOKENS, TOKENS),
+        position_ids=torch.arange(TOKENS)[None],
+        position_embeddings=(torch.ones(1, TOKENS, 8), torch.zeros(1, TOKENS, 8)),
+        adarms_cond=torch.randn(1, HIDDEN),
+        attention_capture=lambda layer_idx, step, weights: events.append((layer_idx, step, weights)),
+        attention_step=3,
+    )
+
+    assert out.shape == hidden.shape
+    assert len(events) == 1
+    layer_idx, step, weights = events[0]
+    assert layer_idx == 0
+    assert step == 3
+    assert weights.shape == (1, 2, TOKENS, TOKENS)

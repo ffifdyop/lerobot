@@ -192,6 +192,10 @@ def _build_saliency_snapshot(
     inference_delay: int,
     prev_chunk_left_over: torch.Tensor | None,
     view_mask=None,
+    *,
+    reset_epoch: int | None = None,
+    chunk_id: int | None = None,
+    observation_time: float | None = None,
 ) -> dict:
     """Copy of everything the saliency explainer needs to replay one chunk exactly.
 
@@ -214,6 +218,12 @@ def _build_saliency_snapshot(
             else prev_chunk_left_over.detach().clone(),
         },
     }
+    if reset_epoch is not None:
+        snapshot["reset_epoch"] = reset_epoch
+    if chunk_id is not None:
+        snapshot["chunk_id"] = chunk_id
+    if observation_time is not None:
+        snapshot["observation_time"] = observation_time
     if view_mask is not None:
         snapshot["view_mask"] = view_mask
     return snapshot
@@ -286,12 +296,11 @@ class RTCInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
         self._failure_traceback: str | None = None
         self._global_shutdown_event = shutdown_event
         self._rtc_thread: Thread | None = None
+        self._saliency_chunk_id = 0
 
         # Optional saliency sink (SaliencyManager). When set, chunks are generated with an
-        # injected noise tensor (sampled here) and every produced chunk is snapshotted to
-        # the sink before the discard guards run — a snapshot may be replayed even if its
-        # chunk is later discarded. The explainer replays it with the exact same noise for
-        # exact gradients.
+        # injected noise tensor (sampled here). A replay snapshot is prepared before
+        # inference but submitted only after the queue accepts the resulting chunk.
         self.saliency_sink = None
 
         if not self._use_torch_compile:
@@ -355,6 +364,7 @@ class RTCInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
         self._action_queue = ActionQueue(self._rtc_config)
         self._obs_holder = {
             "obs": None,
+            "observation_time": None,
             "robot_type": self._robot.robot_type,
         }
         self._shutdown_event.clear()
@@ -408,8 +418,11 @@ class RTCInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
             if self._action_queue is not None:
                 self._action_queue.clear()
             self._obs_holder["obs"] = None
+            self._obs_holder["observation_time"] = None
             self._obs_holder["mask"] = None
             self._reset_epoch += 1
+            if self.saliency_sink is not None and hasattr(self.saliency_sink, "set_reset_epoch"):
+                self.saliency_sink.set_reset_epoch(self._reset_epoch)
         # The queue is empty, so a pending task change has nothing stale to blend against.
         self._discard_task_change()
 
@@ -435,6 +448,8 @@ class RTCInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
             if self._view_mask is not None:
                 self._obs_holder["mask"] = self._view_mask.controller.snapshot()
             self._reset_epoch += 1
+            if self.saliency_sink is not None and hasattr(self.saliency_sink, "set_reset_epoch"):
+                self.saliency_sink.set_reset_epoch(self._reset_epoch)
             self._mask_reset_pending = True
 
     # ------------------------------------------------------------------
@@ -481,6 +496,7 @@ class RTCInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
         """Publish the latest observation (and its mask snapshot) for the RTC thread."""
         with self._obs_lock:
             self._obs_holder["obs"] = obs
+            self._obs_holder["observation_time"] = time.perf_counter()
             # Captured under the same lock as the observation so the RTC thread can
             # never pair one tick's pixels with another tick's mask.
             self._obs_holder["mask"] = (
@@ -555,6 +571,7 @@ class RTCInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
                     else:
                         mask_reset_pending = False
                         obs = self._obs_holder.get("obs")
+                        observation_time = self._obs_holder.get("observation_time")
                         # Read alongside the observation: the mask used for this chunk
                         # must be the one that belongs to these pixels.
                         mask = self._obs_holder.get("mask")
@@ -597,6 +614,7 @@ class RTCInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
                         else:
                             mask_reset_pending = False
                             obs = self._obs_holder.get("obs")
+                            observation_time = self._obs_holder.get("observation_time")
                             mask = self._obs_holder.get("mask")
                             epoch_before = self._reset_epoch
                     if mask_reset_pending:
@@ -672,6 +690,7 @@ class RTCInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
                             )
 
                         noise = None
+                        pending_saliency_snapshot = None
                         if self.saliency_sink is not None:
                             # Snapshot BEFORE the call: `_prepare_batch` → `_pi_aloha_decode_state`
                             # mutates `batch[OBS_STATE]` in place, so a post-call snapshot would
@@ -686,15 +705,17 @@ class RTCInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
                                     policy_device,
                                 )
                                 if self._compile_warmup_done.is_set():
-                                    self.saliency_sink.submit(
-                                        _build_saliency_snapshot(
-                                            preprocessed,
-                                            noise=noise,
-                                            inference_delay=delay,
-                                            prev_chunk_left_over=prev_actions,
-                                            view_mask=mask,
-                                        )
+                                    pending_saliency_snapshot = _build_saliency_snapshot(
+                                        preprocessed,
+                                        noise=noise,
+                                        inference_delay=delay,
+                                        prev_chunk_left_over=prev_actions,
+                                        view_mask=mask,
+                                        reset_epoch=epoch_before,
+                                        chunk_id=self._saliency_chunk_id,
+                                        observation_time=observation_time,
                                     )
+                                    self._saliency_chunk_id += 1
                             except Exception:
                                 # A broken sidecar must never take the live rollout down: degrade
                                 # to the disabled path (no noise injection, no snapshots).
@@ -774,8 +795,9 @@ class RTCInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
                                 or self._view_mask is None
                                 or self._view_mask.is_current(mask.revision)
                             )
+                            merge_result = None
                             if epoch_unchanged and mask_still_current:
-                                queue.merge(
+                                merge_result = queue.merge(
                                     original,
                                     processed,
                                     new_delay,
@@ -783,6 +805,23 @@ class RTCInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
                                     task=task,
                                     mask_revision=None if mask is None else mask.revision,
                                 )
+                                if pending_saliency_snapshot is not None and merge_result.has_actions:
+                                    pending_saliency_snapshot["first_queued_action_index"] = (
+                                        merge_result.first_queued_action_index
+                                    )
+                                    pending_saliency_snapshot["accepted_epoch"] = self._reset_epoch
+                                    # Submission is intentionally inside the same observation
+                                    # critical section as the epoch/mask acceptance check. The
+                                    # sink is non-blocking and only copies a bounded queue entry.
+                                    try:
+                                        self.saliency_sink.submit(pending_saliency_snapshot)
+                                    except Exception:
+                                        logger.warning(
+                                            "Saliency sink failed; disabling saliency for this session",
+                                            exc_info=True,
+                                        )
+                                        self.saliency_sink = None
+                                        pending_saliency_snapshot = None
                         if not epoch_unchanged:
                             logger.info("Discarding action chunk computed before an engine reset")
                         elif not mask_still_current:

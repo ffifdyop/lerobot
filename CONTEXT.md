@@ -58,6 +58,10 @@ _避免_：Control Phase（它描述控制权，而不是遮罩版本是否就�
 Mask Transition 时废弃旧遮罩条件下的待执行动作和策略视觉历史，同时保留当前任务文本。它只清理推理状态，不移动机器人，也不让机器人回到初始姿态。
 _避免_：Robot Reset（机器人复位）、Session Reset（会话复位）
 
+**Next Queued Policy Action（下一入队策略动作）**：
+新动作块被 RTC 接受后，扣除推理延迟期间已过时的前 `d` 项，保留下来的第一个策略空间动作 `a_d`。它对应下一个可执行入队动作，但本身尚未经机器人侧后处理或安全裁剪。
+_避免_：First Chunk Action（RTC 下的 `a₀` 可能因推理延迟被丢弃）、Executed Action
+
 **Local Policy（本地策略）**：
 网络在本进程内运行的策略，其内部结构（梯度、attention）可直接检查。SmolVLA 是本地策略。
 _避免_：离线策略
@@ -65,25 +69,37 @@ _避免_：离线策略
 **Remote Policy（远程策略）**：
 经网络（HTTP/websocket）服务的策略；rollout 进程只能看到观测 → 动作对，永远接触不到网络内部。DM05 与 openpi 策略是远程策略。
 
+**Observation Memory（MEM 观测记忆）**：
+π0.5 的可选扩展，使当前 Policy Proposal 可依赖抽样的历史相机观测和/或本体状态。它不是基础 π0.5 的默认语义。
+_避免_：π0.5 历史（容易误解为所有 π0.5 都含历史观测）
+
 ### 显著性可视化
 
 **Saliency Map（热力图）**：
-每个相机一张的重要性图，表示策略当前正在执行的那个动作（a₀ = chunk 首个被执行动作）与输入的关系。每个相机每个策略节拍一张。现有两种实现方法（method），通过 `--saliency.method` 选择。
+每个相机一张的重要性图；Policy 控制期间，表示本地策略的 Next Queued Policy Action `a_d` 与产生它的输入之间的关系，被 RTC 拒绝的动作块不作为解释目标。Policy 不拥有控制权时，只能将该图解释为 Shadow Saliency；旁路处理允许跳过观测，不保证每个策略节拍都有图。受 View Mask 影响的视角仍保留模型对遮罩后图像实际产生的 saliency，不得人为清零或隐藏。
+
+**Shadow Saliency（影子热力图）**：
+Shadow Policy 对当前观测产生的反事实热力图，表示“若此刻由策略控制，它会关注哪里”。它不解释人工动作，也不表示图中的 Policy Proposal 已经或即将被执行。
+_避免_：人工动作热力图、Executed-Action Saliency
 
 **Pixel Sensitivity Map（像素敏感度图）**：
-热力图的第一种方法（`grad_x_input`）：像素级，表示每个输入像素对 a₀ 的贡献量。"贡献"的精确定义（2026-09-11 确认）：该像素放大/缩小当前指令幅度的能力，即 ∂‖a₀‖²/∂x——因此动作值加权是有意的：指令幅度接近零（姿态过均值点）时全图变暗是正确行为，幅度大的关节主导也是正确行为。
+热力图的第一种方法（`grad_x_input`）：像素级，表示每个输入像素对 Next Queued Policy Action `a_d` 的贡献量。"贡献"的精确定义（2026-09-11 确认）：该像素放大/缩小当前指令幅度的能力，即 ∂‖a_d‖²/∂x——因此动作值加权是有意的：指令幅度接近零（姿态过均值点）时全图变暗是正确行为，幅度大的关节主导也是正确行为。
 _避免_：关节等权敏感度（曾被考虑并否决——舵机角度值加权正是所需语义）
 
+**Action Token（动作 token）**：
+模型内部对动作块中一个时间位置的整体表示，一个 token 同时承载该时间位置的全部关节和夹爪动作，不表示单个关节。
+_避免_：Action Dimension（动作向量的一个分量）
+
 **Patch Attention Map（Patch 注意力图）**：
-热力图的第二种方法（`attention`）：patch 级（每相机 8×8），表示 a₀ 动作 token 对各图像 patch token 的 cross-attention 份额（heads 与 denoise steps 取均值，原始份额不做重归一化——模型看语言多时整图变暗是正确行为）。
+热力图的第二种方法（`attention`）：patch 级，表示 Next Queued Policy Action `a_d` 的动作 token 对各图像 patch token 的 attention 份额。heads 始终取均值；可选择参与聚合的模型层和 denoise steps，默认使用全部可用层与全部 steps。原始份额不做重归一化——模型看非视觉上下文多时整图变暗是正确行为。不同策略的 patch 网格尺寸可不同。
 
 **Attention Budget Bar（注意力预算条）**：
-a₀ 动作 token 的 cross-attention 质量在五份上的分配——cam1 / cam2 / cam3 / 语言 / state，总和恒等于 1。以堆叠横条叠加在叠加热力图视频每帧顶部。
+Next Queued Policy Action `a_d` 的动作 token 在各类 token 上的原始 attention 质量分配，包括各相机、语言或 prompt、独立 state（若存在）以及 action。action 段合并该 token 对自身和其他动作 token 的份额，不再细分。不丢弃 action 份额，不对上下文重归一化，总和恒等于 1。π0.5 将任务文本和离散化状态统一标为 `prompt`。预算以堆叠横条叠加在叠加热力图视频每帧顶部。
 
 **Saliency Overlay Video（叠加热力图视频）**：
 原始相机画面与其热力图（任一 method）混叠后的视频，每个相机每次 rollout 运行各一个文件，供事后检查。
 _避免_：调试视频
 
 **Explainer（解释器）**：
-策略无关的组件：输入一份观测和本地策略，产出热力图。本地策略默认获得热力图能力；特殊架构通过按策略注册的解释器覆盖通用实现。
+面向特定本地策略及解释方法的组件，将一次策略决策及其输入关联到对应的热力图。本地策略身份本身不意味着已经具有可用的解释器。
 _避免_：可视化器（专指 rerun/foxglove 显示后端）

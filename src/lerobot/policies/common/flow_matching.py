@@ -70,6 +70,7 @@ def euler_integrate(
     execution_horizon: int | None = None,
     hard_prefix: Tensor | None = None,
     hard_prefix_mask: Tensor | None = None,
+    preserve_graph: bool = False,
 ) -> Tensor:
     """Forward-Euler integration of a velocity field from t=1 (noise) to t=0 (actions).
 
@@ -93,6 +94,8 @@ def euler_integrate(
         execution_horizon: RTC guidance parameter, forwarded verbatim.
         hard_prefix: Optional clean action prefix to clamp throughout denoising.
         hard_prefix_mask: Boolean mask selecting the values clamped from ``hard_prefix``.
+        preserve_graph: Sidecar-only graph-preserving RTC replay. False keeps the native
+            detached Jacobian path and is the default for training/control.
     """
     bsize = noise.shape[0]
     device = noise.device
@@ -114,13 +117,18 @@ def euler_integrate(
             return denoise_fn(input_x_t, current_timestep)
 
         if rtc_enabled:
-            v_t = rtc_processor.denoise_step(
+            rtc_kwargs = dict(
                 x_t=x_t,
                 prev_chunk_left_over=prev_chunk_left_over,
                 inference_delay=inference_delay,
                 time=time,
                 original_denoise_step_partial=denoise_step_partial_call,
                 execution_horizon=execution_horizon,
+            )
+            if preserve_graph:
+                rtc_kwargs["preserve_graph"] = True
+            v_t = rtc_processor.denoise_step(
+                **rtc_kwargs,
             )
         else:
             v_t = denoise_step_partial_call(x_t)

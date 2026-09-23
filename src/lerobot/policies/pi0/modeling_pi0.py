@@ -16,6 +16,7 @@
 
 import builtins
 import logging
+from collections.abc import Callable
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
@@ -408,6 +409,11 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         super().__init__()
         self.config = config
         self.rtc_processor = rtc_processor
+        # Optional per-instance tap used only by the rollout saliency sidecar.  It is
+        # deliberately None on normal training/control models.
+        self.attention_capture: Callable[[int, int | None, Tensor], None] | None = None
+        self.attention_step: int | None = None
+        self._attention_num_steps: int | None = None
 
         paligemma_config = get_gemma_config(config.paligemma_variant)
         action_expert_config = get_gemma_config(config.action_expert_variant)
@@ -655,6 +661,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         """Do a full inference forward and compute the action."""
         if num_steps is None:
             num_steps = self.config.num_inference_steps
+        self._attention_num_steps = int(num_steps)
 
         bsize = state.shape[0]
         device = state.device
@@ -676,6 +683,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        # Prefix prefill is intentionally excluded from action-expert saliency.
+        self.paligemma_with_expert.gemma_expert.model.attention_capture = None
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -700,6 +709,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             inference_delay=kwargs.get("inference_delay"),
             prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
             execution_horizon=kwargs.get("execution_horizon"),
+            preserve_graph=getattr(self, "_saliency_preserve_graph", False),
         )
 
     def denoise_step(
@@ -711,6 +721,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
+        if self.attention_capture is not None and self._attention_num_steps:
+            self.attention_step = int(round((1.0 - float(timestep[0].detach().item())) * self._attention_num_steps))
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
 
         suffix_len = suffix_pad_masks.shape[1]
@@ -726,6 +738,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         full_att_2d_masks_4d = prepare_attention_masks_4d(full_att_2d_masks)
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.gemma_expert.model.attention_capture = self.attention_capture
+        self.paligemma_with_expert.gemma_expert.model.attention_step = self.attention_step
 
         past_key_values = clone_past_key_values(past_key_values)
         outputs_embeds, _ = self.paligemma_with_expert.forward(

@@ -275,6 +275,51 @@ def test_get_prefix_weights_with_start_greater_than_end():
     assert torch.all(weights[10:] == 0.0)
 
 
+def test_guided_saliency_replay_preserves_forward_and_input_gradient():
+    """The sidecar graph path is value-equivalent and matches a finite difference.
+
+    The production RTC call keeps its historical detached inner Jacobian.  The
+    ``preserve_graph`` path only retains the outer image/latent graph needed by
+    saliency; it must not silently change the guided action values.
+    """
+    config = RTCConfig(
+        prefix_attention_schedule=RTCAttentionSchedule.ONES,
+        max_guidance_weight=5.0,
+        execution_horizon=2,
+    )
+    processor = RTCProcessor(config)
+    previous = torch.tensor([[[0.1], [0.2]]])
+
+    def run(image: torch.Tensor, *, preserve_graph: bool) -> torch.Tensor:
+        latent = image + 0.2
+
+        def denoise(value: torch.Tensor) -> torch.Tensor:
+            return 0.3 * value + 0.4 * image
+
+        return processor.denoise_step(
+            latent,
+            previous,
+            inference_delay=0,
+            time=0.7,
+            original_denoise_step_partial=denoise,
+            preserve_graph=preserve_graph,
+        )
+
+    image = torch.tensor([[[0.7], [0.4]]], requires_grad=True)
+    native = run(image.detach(), preserve_graph=False)
+    replay = run(image, preserve_graph=True)
+    assert torch.allclose(native, replay, atol=1e-6, rtol=0.0)
+    gradient = torch.autograd.grad(replay.sum(), image)[0]
+
+    def scalar(value: float) -> float:
+        sample = torch.tensor([[[value], [0.4]]])
+        return float(run(sample, preserve_graph=True).sum().detach())
+
+    h = 1e-3
+    finite_difference = (scalar(0.7 + h) - scalar(0.7 - h)) / (2 * h)
+    assert gradient[0, 0, 0].item() == pytest.approx(finite_difference, abs=2e-3)
+
+
 # ====================== Helper Method Tests ======================
 
 

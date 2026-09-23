@@ -166,6 +166,7 @@ def _get_pi_gemma_decoder_layer_base():
             self.post_attention_layernorm = PiGemmaRMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim
             )
+            self.layer_idx = layer_idx
 
         def forward(
             self,
@@ -177,11 +178,14 @@ def _get_pi_gemma_decoder_layer_base():
             cache_position: torch.LongTensor | None = None,
             position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
             adarms_cond: torch.Tensor | None = None,
+            attention_capture=None,
+            attention_step: int | None = None,
+            output_attentions: bool | None = None,
             **kwargs,
         ) -> torch.Tensor:
             residual = hidden_states
             hidden_states, gate = self.input_layernorm(hidden_states, cond=adarms_cond)
-            hidden_states, _ = self.self_attn(
+            attention_output = self.self_attn(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -189,8 +193,15 @@ def _get_pi_gemma_decoder_layer_base():
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                output_attentions=(attention_capture is not None) or bool(output_attentions),
                 **kwargs,
             )
+            if isinstance(attention_output, tuple):
+                hidden_states, attention_weights = attention_output[:2]
+            else:
+                hidden_states, attention_weights = attention_output, None
+            if attention_capture is not None and attention_weights is not None:
+                attention_capture(self.layer_idx, attention_step, attention_weights)
 
             hidden_states = _gated_residual(residual, hidden_states, gate)
 
@@ -315,6 +326,8 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 adarms_cond=adarms_cond,
+                attention_capture=getattr(self, "attention_capture", None),
+                attention_step=getattr(self, "attention_step", None),
                 **kwargs,
             )
 

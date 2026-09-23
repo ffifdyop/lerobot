@@ -22,6 +22,7 @@ handling action merging and leftover tracking.
 """
 
 import logging
+from dataclasses import dataclass
 from threading import Lock
 
 import torch
@@ -30,6 +31,21 @@ from torch import Tensor
 from .configuration_rtc import RTCConfig
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ActionQueueMergeResult:
+    """Metadata describing an already-completed queue merge.
+
+    ``first_queued_action_index`` is relative to the incoming chunk.  It is
+    deliberately separate from the delay used to condition the model: the
+    latter is an inference-time estimate, while this value is the queue's
+    actual result.
+    """
+
+    first_queued_action_index: int
+    has_actions: bool
+    accepted: bool = True
 
 
 class ActionQueue:
@@ -210,10 +226,9 @@ class ActionQueue:
             delay = self._check_and_resolve_delays(real_delay, action_index_before_inference)
 
             if self.cfg.enabled:
-                self._replace_actions_queue(original_actions, processed_actions, delay, task, mask_revision)
-                return
+                return self._replace_actions_queue(original_actions, processed_actions, delay, task, mask_revision)
 
-            self._append_actions_queue(original_actions, processed_actions, task, mask_revision)
+            return self._append_actions_queue(original_actions, processed_actions, task, mask_revision)
 
     def _replace_actions_queue(
         self,
@@ -222,7 +237,7 @@ class ActionQueue:
         real_delay: int,
         task: str | None,
         mask_revision: int | None,
-    ):
+    ) -> ActionQueueMergeResult:
         """Replace the queue with new actions (RTC mode).
 
         Discards the first `real_delay` actions since they correspond to the time
@@ -250,6 +265,10 @@ class ActionQueue:
         logger.debug(f"real_delay: {real_delay}, clamped_delay: {clamped_delay}")
 
         self.last_index = 0
+        return ActionQueueMergeResult(
+            first_queued_action_index=clamped_delay,
+            has_actions=len(self.queue) > 0,
+        )
 
     def _append_actions_queue(
         self,
@@ -257,7 +276,7 @@ class ActionQueue:
         processed_actions: Tensor,
         task: str | None,
         mask_revision: int | None,
-    ):
+    ) -> ActionQueueMergeResult:
         """Append new actions to the queue (non-RTC mode).
 
         Removes already-consumed actions and appends new ones, maintaining
@@ -277,7 +296,7 @@ class ActionQueue:
             self._mask_revision_queue = (
                 None if mask_revision is None else [mask_revision] * len(self.queue)
             )
-            return
+            return ActionQueueMergeResult(first_queued_action_index=0, has_actions=len(self.queue) > 0)
 
         existing_tasks = self._task_queue or [None] * len(self.queue)
         if self._mask_revision_queue is None and mask_revision is None:
@@ -298,6 +317,7 @@ class ActionQueue:
             self._mask_revision_queue = None
 
         self.last_index = 0
+        return ActionQueueMergeResult(first_queued_action_index=0, has_actions=len(self.queue) > 0)
 
     def _check_and_resolve_delays(
         self, real_delay: int, action_index_before_inference: int | None = None

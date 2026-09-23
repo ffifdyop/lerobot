@@ -127,6 +127,7 @@ class RTCProcessor:
         time,
         original_denoise_step_partial,
         execution_horizon=None,
+        preserve_graph: bool = False,
     ) -> Tensor:
         """RTC guidance wrapper around an existing denoiser.
 
@@ -174,7 +175,12 @@ class RTCProcessor:
             v_t = original_denoise_step_partial(x_t)
             return v_t
 
-        x_t = x_t.clone().detach()
+        # The native RTC path intentionally detaches the latent before its internal
+        # Jacobian. The saliency-only path keeps the latent graph connected: this is
+        # required for a finite-difference-correct image derivative through a guided
+        # multi-step rollout. The scalar values and the partial Jacobian at each step
+        # are unchanged; only the graph used by the sidecar is retained.
+        x_t = x_t.clone() if preserve_graph else x_t.clone().detach()
 
         squeezed = False
         if len(x_t.shape) < 3:
@@ -215,13 +221,30 @@ class RTCProcessor:
         )
 
         with torch.enable_grad():
+            if preserve_graph:
+                x_t.requires_grad_(True)
             v_t = original_denoise_step_partial(x_t)
-            x_t.requires_grad_(True)
+            if not preserve_graph:
+                x_t.requires_grad_(True)
 
             x1_t = x_t - time * v_t  # noqa: N806
             err = (prev_chunk_left_over - x1_t) * weights
-            grad_outputs = err.clone().detach()
-            correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
+            if preserve_graph:
+                # In the native path ``v_t`` is evaluated before ``x_t`` is marked
+                # differentiable, so its local Jacobian is intentionally absent and
+                # the inner autograd call returns ``err`` itself. Keep that exact
+                # forward correction while retaining ``err``'s image/latent graph for
+                # the sidecar derivative. This avoids changing the shared RTC detach
+                # contract or doing a second denoiser evaluation.
+                correction = err
+            else:
+                correction = torch.autograd.grad(
+                    x1_t,
+                    x_t,
+                    err.clone().detach(),
+                    retain_graph=False,
+                    create_graph=False,
+                )[0]
 
         max_guidance_weight = torch.as_tensor(self.rtc_config.max_guidance_weight)
         tau_tensor = torch.as_tensor(tau)

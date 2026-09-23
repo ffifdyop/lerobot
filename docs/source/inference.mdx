@@ -574,6 +574,51 @@ In [interactive sessions](#interactive-sessions) each `/start` segment owns its 
 
 ---
 
+## Rollout saliency
+
+Rollout saliency is an asynchronous diagnostic sidecar for local SmolVLA, π0 and π0.5
+policies running with the RTC inference engine. It supports pixel sensitivity
+(`grad_x_input`) and action-expert attention (`attention`):
+
+```bash
+lerobot-rollout \
+  --policy.path=/path/to/local/checkpoint \
+  --display_data=true \
+  --display_mode=rerun \
+  --inference.type=rtc \
+  --saliency.enabled=true \
+  --saliency.method=attention
+```
+
+Replace the checkpoint path and append your existing robot/camera options. The
+example uses all valid layers and steps, so it works across the three architectures.
+To select a subset, add `--saliency.attention_layers='[1]'` and
+`--saliency.attention_steps='[0]'` only if those indices exist in your checkpoint.
+SmolVLA accepts cross-attention layers only (normally odd layers); π accepts
+action-expert layer indices. For video-only output, use `--saliency.display=false`;
+then the two display flags above are not required.
+
+The default layer/step selection is all valid layers and denoising steps. The
+attention map is an average of the selected events and keeps raw attention mass;
+the video budget bar includes camera, prompt/language, state (when separate), and
+action mass. The target is the first action retained by RTC (`a_d`), not necessarily
+the action currently being sent to the robot.
+
+For attention, layer and step numbers are zero-based and refer to the model's real
+action-expert/cross-attention events; `None` means select all. π0 reads query `1+d`
+(its suffix starts with a continuous state token), while π0.5 and SmolVLA read query
+`d`. The default mean is a whole-run overview, not a claim that shallow/deep layers
+or early/late denoising steps have fixed meanings. Multi-group comparisons from one
+replay are reserved for a later extension.
+
+The sidecar snapshots inputs before inference but submits a snapshot only after its
+chunk is accepted by the RTC queue. It replays the snapshot on a separate eager model
+copy; the replayed action is never sent to the robot. π0.5 visual/proprioceptive MEM
+is not supported with saliency yet and is rejected before the sidecar loads weights.
+Disabling saliency leaves the normal training and inference paths unchanged. Enabling
+it adds a model copy and asynchronous work, so dropped diagnostic frames and timing
+overhead are expected.
+
 ## Programmatic Usage
 
 For custom deployments (e.g. with kinematics processors), use the rollout module API directly:

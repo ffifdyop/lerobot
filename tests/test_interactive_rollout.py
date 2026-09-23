@@ -1380,9 +1380,51 @@ class _RecordingSink:
         self.snapshots.append(snapshot)
 
 
+def test_rtc_engine_without_saliency_does_not_sample_or_snapshot(monkeypatch):
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.rollout.inference import RTCInferenceEngine, rtc
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("saliency-disabled engine invoked a saliency operation")
+
+    monkeypatch.setattr(rtc, "_build_saliency_snapshot", forbidden)
+    monkeypatch.setattr(torch, "randn", forbidden)
+    received = []
+
+    class Policy(_StubChunkPolicy):
+        def predict_action_chunk(self, batch, noise=None, **kwargs):
+            received.append(noise)
+            return super().predict_action_chunk(batch, **kwargs)
+
+    policy = Policy(chunk_len=10, action_dim=2)
+    engine = RTCInferenceEngine(
+        policy=policy,
+        preprocessor=_IdentityPipeline(),
+        postprocessor=_IdentityPipeline(),
+        robot_wrapper=SimpleNamespace(robot_type="mock", action_features={}),
+        rtc_config=RTCConfig(enabled=True, execution_horizon=8),
+        hw_features={"observation.state": {"dtype": "float32", "shape": (2,), "names": ["j1.pos", "j2.pos"]}},
+        task="task A",
+        fps=30.0,
+        device="cpu",
+    )
+    engine.start()
+    try:
+        engine.resume()
+        engine.notify_observation(dict(_RTC_OBS))
+        policy.allow_one_inference()
+        assert _wait_for(lambda: engine.action_queue.qsize() > 0)
+        assert received and all(noise is None for noise in received)
+        assert engine.saliency_sink is None
+    finally:
+        policy.unblock()
+        engine.stop()
+
+
 def test_rtc_engine_saliency_sink_noise_injection_and_snapshot_order():
     """With a sink attached the engine samples the flow-matching noise itself, snapshots
-    the replay inputs BEFORE calling the policy, and passes that noise to the policy."""
+    the replay inputs BEFORE calling the policy, but submits only after the resulting chunk
+    is accepted by the queue."""
     from lerobot.policies.rtc.configuration_rtc import RTCConfig
     from lerobot.rollout.inference import RTCInferenceEngine
 
@@ -1439,13 +1481,20 @@ def test_rtc_engine_saliency_sink_noise_injection_and_snapshot_order():
     assert noise is not None
     assert torch.equal(noise, snapshot["noise"])
 
-    # (b) the snapshot was submitted before the policy was called
+    # (b) the snapshot is submitted after the policy call and queue merge
     first_submit = events.index(next(e for e in events if e[0] == "submit"))
     first_call = events.index(next(e for e in events if e[0] == "call"))
-    assert first_submit < first_call
+    assert first_submit > first_call
 
     # (c) the snapshot carries deep-copied tensors, not views of the batch
-    assert set(snapshot) == {"preprocessed", "noise", "chunk_kwargs"}
+    assert {
+        "preprocessed",
+        "noise",
+        "chunk_kwargs",
+        "first_queued_action_index",
+        "observation_time",
+    }.issubset(snapshot)
+    assert 0 <= snapshot["first_queued_action_index"] < policy.config.chunk_size
     batch = policy.received_batches[0]
     state = batch["observation.state"]
     snap_state = snapshot["preprocessed"]["observation.state"]
@@ -1503,8 +1552,10 @@ def test_rtc_engine_sink_failure_disables_saliency(caplog):
         engine.notify_observation(dict(_RTC_OBS))
         policy.allow_one_inference()
         assert _wait_for(lambda: len(policy.received_noise) >= 1)
-        # degraded: the policy sampled internally (no injected noise) and the sink is off
-        assert policy.received_noise[0] is None
+        # Submission happens after the policy/queue acceptance now, so this frame may
+        # already have used injected noise; the failing sink is disabled for subsequent
+        # frames and never interrupts control.
+        assert policy.received_noise[0] is not None
         assert engine.saliency_sink is None
         with caplog.at_level(logging.WARNING, logger="lerobot.rollout.inference.rtc"):
             assert _wait_for(lambda: any("disabling saliency" in r.getMessage() for r in caplog.records))

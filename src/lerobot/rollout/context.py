@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from threading import Event
 from typing import TYPE_CHECKING
@@ -460,19 +460,12 @@ def build_rollout_context(
             # without the device override, from_pretrained would load onto the policy's
             # GPU first (config object is shared), transiently doubling policy-GPU
             # residency before .to(explainer_device) moves it.
-            prev_compile = getattr(policy_config, "compile_model", None)
-            prev_device = getattr(policy_config, "device", None)
-            if prev_compile is not None:
-                policy_config.compile_model = False
-            if prev_device is not None:
-                policy_config.device = saliency_explainer_device
-            try:
-                return _load_pretrained_policy(policy_config)
-            finally:
-                if prev_compile is not None:
-                    policy_config.compile_model = prev_compile
-                if prev_device is not None:
-                    policy_config.device = prev_device
+            explainer_config = deepcopy(policy_config)
+            if hasattr(explainer_config, "compile_model"):
+                explainer_config.compile_model = False
+            if hasattr(explainer_config, "device"):
+                explainer_config.device = saliency_explainer_device
+            return _load_pretrained_policy(explainer_config)
 
         logger.info("Saliency enabled — loading explainer model copy on %s...", saliency_explainer_device)
         saliency_manager = SaliencyManager(
