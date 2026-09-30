@@ -12,10 +12,16 @@ SERVER_PORT="7891"
 # 注意该目录在 .gitignore 的 models/ 下，为本机部署产物
 POLICY_PATH="models/opendm/deploy/dm05_folding"
 
+# --- 串口：一律用 /dev/serial/by-id/，不要写 /dev/ttyACM<N> ---
+# ttyACM 编号按「接入顺序」分配且断开后会被复用，拔插一次就可能重排；
+# 一旦左右臂串口互换，lerobot 会拿另一条臂的标定文件去校验电机，
+# is_calibrated 判定失败 → 弹出重建标定提示（按回车或输 c 都会写坏 EPROM/文件）。
+# by-id 按适配器序列号固定，与插拔顺序无关。
+# 若下面任一路径不存在：ls -la /dev/serial/by-id/
 # 左从臂串口
-LEFT_FOLLOWER_PORT="/dev/ttyACM2"
+LEFT_FOLLOWER_PORT="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B3D042915-if00"
 # 右从臂串口
-RIGHT_FOLLOWER_PORT="/dev/ttyACM3"
+RIGHT_FOLLOWER_PORT="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B3D046378-if00"
 
 check_port() {
     local port=$1

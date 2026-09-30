@@ -1,13 +1,19 @@
+# --- 串口：一律用 /dev/serial/by-id/，不要写 /dev/ttyACM<N> ---
+# ttyACM 编号按「接入顺序」分配且断开后会被复用，拔插一次就可能重排；
+# 一旦左右臂串口互换，lerobot 会拿另一条臂的标定文件去校验电机，
+# is_calibrated 判定失败 → 弹出重建标定提示（按回车或输 c 都会写坏 EPROM/文件）。
+# by-id 按适配器序列号固定，与插拔顺序无关。
+# 若下面任一路径不存在：ls -la /dev/serial/by-id/
 # 左从臂串口
-LEFT_FOLLOWER_PORT="/dev/ttyACM2"
+LEFT_FOLLOWER_PORT="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B3D042915-if00"
 # 右从臂串口
-RIGHT_FOLLOWER_PORT="/dev/ttyACM3"
+RIGHT_FOLLOWER_PORT="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B3D046378-if00"
 
 # --- 主臂串口 ---
 # 左主臂串口
-LEFT_LEADER_PORT="/dev/ttyACM0"
+LEFT_LEADER_PORT="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B3E089335-if00"
 # 右主臂串口
-RIGHT_LEADER_PORT="/dev/ttyACM1"
+RIGHT_LEADER_PORT="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B3D044325-if00"
 
 check_port() {
     local port=$1
@@ -42,8 +48,8 @@ sudo chmod 666 "$LEFT_FOLLOWER_PORT" "$RIGHT_FOLLOWER_PORT" "$LEFT_LEADER_PORT" 
 
 lerobot-replay \
     --robot.type=bi_so_follower \
-    --robot.left_arm_config.port=/dev/ttyACM2 \
-    --robot.right_arm_config.port=/dev/ttyACM3 \
+    --robot.left_arm_config.port="$LEFT_FOLLOWER_PORT" \
+    --robot.right_arm_config.port="$RIGHT_FOLLOWER_PORT" \
     --robot.left_arm_config.use_degrees=false \
     --robot.right_arm_config.use_degrees=false \
     --robot.id=bimanual_follower \

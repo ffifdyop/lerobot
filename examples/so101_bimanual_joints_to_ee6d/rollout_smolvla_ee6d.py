@@ -77,8 +77,13 @@ DURATION_SEC = 360
 EXECUTION_HORIZON = 10  # recompute an action chunk every N ticks, execute its first N actions
 TASK = "fold the garment on the table"
 
-LEFT_FOLLOWER_PORT = "/dev/ttyACM2"
-RIGHT_FOLLOWER_PORT = "/dev/ttyACM3"
+# Use /dev/serial/by-id/ (adapter serial), never /dev/ttyACM<N>: those numbers are
+# assigned in attach order and get reused, so a re-plug can silently swap the two
+# follower arms. When that happens lerobot validates each arm's motors against the
+# *other* arm's calibration file, `is_calibrated` fails, and connect() prompts to
+# recalibrate — answering it writes the wrong homing offsets to the motors.
+LEFT_FOLLOWER_PORT = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B3D042915-if00"
+RIGHT_FOLLOWER_PORT = "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B3D046378-if00"
 LEFT_WRIST_CAM = "/dev/video0"
 RIGHT_WRIST_CAM = "/dev/video8"
 TOP_CAM = "/dev/video6"

@@ -87,13 +87,11 @@ RENAME_MAP='{}'
 # POLICY_PATH=models/lehome/train/smolvla/smolvla-real_720p_ft_20260830_142257/checkpoints/020000/pretrained_model
 # POLICY_PATH=models/train/pi05/pi05-real_ft_20260701_202015/checkpoints/040000/pretrained_model
 
-POLICY_PATH=models/lerobot/pi05_so101_bimanual_folding_cloth_20260921_224353/checkpoints/040000/pretrained_model
+POLICY_PATH=models/lerobot/pi05_so101_bimanual_folding_cloth_20260925_211107/checkpoints/040000/pretrained_model
 
 lerobot-rollout \
   --strategy.type=base \
   --policy.path=$POLICY_PATH \
-  --inference.type=rtc \
-  --inference.rtc.execution_horizon=10 \
   --robot.type=bi_so_follower \
   --robot.left_arm_config.port=$LEFT_FOLLOWER_PORT \
   --robot.right_arm_config.port=$RIGHT_FOLLOWER_PORT \
@@ -106,11 +104,13 @@ lerobot-rollout \
   --rename_map="$RENAME_MAP" \
   --task="fold the garment on the table" \
   --duration=360 \
-  --saliency.enabled=true \
-  --saliency.method=attention \
-  --saliency.video_fps=1 \
-  --display_data=true --display_mode=rerun \
-  --view_mask.enabled=true \
+  --inference.type=sync \
+  # --inference.rtc.execution_horizon=10 \
+  # --saliency.enabled=true \
+  # --saliency.method=attention \
+  # --saliency.video_fps=1 \
+  # --display_data=true --display_mode=rerun \
+  # --view_mask.enabled=true \
   # --view_mask.initial_views='["top"]' \
 
   # --- 当前 pi05 checkpoint 的 saliency 用法（参数已在上方启用）---
