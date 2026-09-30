@@ -39,6 +39,7 @@ import torch
 from datasets.features.features import register_feature
 from PIL import Image
 
+from lerobot.transforms import apply_image_transforms
 from lerobot.configs import (
     DEPTH_METER_UNIT,
     DepthEncoderConfig,
@@ -115,7 +116,7 @@ def apply_rgb_transforms(
         return
     for key in camera_keys:
         if key not in depth_keys:
-            item[key] = transforms(item[key])
+            item[key] = apply_image_transforms(transforms, item[key], key)
 
 
 def decode_video_frames(

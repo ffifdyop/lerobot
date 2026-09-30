@@ -45,6 +45,7 @@ from .transforms import (
     ImageTransformsConfig,
     JPEGCompression,
     PerSampleTransform,
+    apply_image_transforms,
     make_batched_transform_from_config,
 )
 
@@ -67,6 +68,7 @@ __all__ = [
     "BatchedSharpnessJitter",
     "BatchedTransform",
     "CoarseDropout",
+    "apply_image_transforms",
     "GammaCorrection",
     "GaussianNoise",
     "GaussianPatchBrightness",

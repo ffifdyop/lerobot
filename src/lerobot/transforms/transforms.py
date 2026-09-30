@@ -129,6 +129,8 @@ _PLANCKIAN_TEMPERATURE_STEP = 500
 # augmentation be reproduced from a seed, leave the default generators (and so the policy's own
 # noise) untouched, and run compiled or one chunk at a time without changing what is applied.
 
+from .openpi import OpenPIImageAugmentation
+
 ImageTransformsBackend = Literal["dataloader", "gpu"]
 
 
@@ -471,6 +473,7 @@ def apply_to_frames(
     generator: torch.Generator | None = None,
     run: Callable[[Tensor, dict[str, Any]], Tensor] | None = None,
     chunk_size: int | None = None,
+    camera_key: str | None = None,
 ) -> Tensor:
     """Apply a batched transform to `uint8` or floating point frames, returning the input's dtype.
 
@@ -500,7 +503,7 @@ def apply_to_frames(
         work = frames.to(torch.float32)
     else:
         raise TypeError(f"Expected uint8 or floating point images, got {frames.dtype}.")
-    params = _tag_params(transform.make_params(work.shape, work.device, generator), uint8_input)
+    params = _tag_params(transform.make_params(work.shape, work.device, generator), uint8_input, camera_key)
     run = run or transform.transform
     batch_size = work.shape[0]
     if chunk_size is None or batch_size <= chunk_size:
@@ -518,15 +521,16 @@ def apply_to_frames(
     return out.to(frames.dtype)
 
 
-def _tag_params(params: Any, uint8_input: bool) -> Any:
+def _tag_params(params: Any, uint8_input: bool, camera_key: str | None = None) -> Any:
     """Record `uint8_input` in every dict of a parameter tree drawn by `make_params`."""
     if isinstance(params, dict):
         return {
-            **{key: _tag_params(value, uint8_input) for key, value in params.items()},
+            **{key: _tag_params(value, uint8_input, camera_key) for key, value in params.items()},
+            **({"camera_key": camera_key} if camera_key is not None else {}),
             "uint8_input": uint8_input,
         }
     if isinstance(params, list):
-        return [_tag_params(value, uint8_input) for value in params]
+        return [_tag_params(value, uint8_input, camera_key) for value in params]
     return params
 
 
@@ -1395,14 +1399,23 @@ class PerSampleTransform(BatchedTransform):
             if uint8_input:
                 sample = (sample * 255.0).round_().clamp_(0, 255).to(torch.uint8)
             with nullcontext() if seed is None else _seeded_default_generators(seed, frames.device):
-                out = self.per_sample(sample)
-            outputs.append(out.to(frames.dtype) / 255.0 if uint8_input else out)
+                if isinstance(self.per_sample, OpenPIImageAugmentation):
+                    camera_key = params.get("camera_key")
+                    if camera_key is None:
+                        raise ValueError("OpenPIImageAugmentation requires camera_key for wrist-camera handling.")
+                    out = self.per_sample(sample, camera_key=camera_key)
+                else:
+                    out = self.per_sample(sample)
+                    if uint8_input:
+                        out = out.to(frames.dtype) / 255.0
+            outputs.append(out)
         return torch.stack(outputs)
 
 
 # LeRobot transforms with no batched implementation; `PerSampleTransform` wraps them.
 _PER_SAMPLE_TRANSFORMS: dict[str, type[Transform]] = {
     "JPEGCompression": JPEGCompression,
+    "OpenPIImageAugmentation": OpenPIImageAugmentation,
 }
 
 # Batched counterparts, keyed by the same type names as `ImageTransformConfig.type`.
@@ -1601,6 +1614,12 @@ class BatchedImageTransforms(nn.Module):
         self.transforms = nn.ModuleDict(transforms)
         self.weights = weights
         n_subset = min(len(transforms), cfg.max_num_transforms)
+        # OpenPI's recipe returns normalized float32, including for uint8 frames.
+        # Native transforms retain the original input-dtype contract.
+        self._openpi_enabled = cfg.enable and n_subset > 0 and any(
+            isinstance(tf, PerSampleTransform) and isinstance(tf.per_sample, OpenPIImageAugmentation)
+            for tf in transforms.values()
+        )
         self.tf: BatchedTransform
         if n_subset == 0 or not cfg.enable:
             self.tf = BatchedIdentity()
@@ -1617,7 +1636,9 @@ class BatchedImageTransforms(nn.Module):
         """Transform float `(B, N, C, H, W)` frames with parameters drawn by `self.tf.make_params`."""
         return self.tf.transform(frames, params)
 
-    def forward(self, images: Tensor, generator: torch.Generator | None = None) -> Tensor:
+    def forward(
+        self, images: Tensor, generator: torch.Generator | None = None, *, camera_key: str | None = None
+    ) -> Tensor:
         """Transform a batch of images or frame stacks.
 
         Args:
@@ -1638,8 +1659,12 @@ class BatchedImageTransforms(nn.Module):
             )
         if images.shape[-3] not in (1, 3):
             raise ValueError(f"Expected 1 or 3 channels, got shape {tuple(images.shape)}.")
+        if self._openpi_enabled:
+            images = images.to(torch.float32) / 255.0 if images.dtype == torch.uint8 else images.to(torch.float32)
         frames = images.unsqueeze(1) if images.ndim == 4 else images
-        out = apply_to_frames(self.tf, frames, generator, run=self._transform, chunk_size=self.chunk_size)
+        out = apply_to_frames(
+            self.tf, frames, generator, run=self._transform, chunk_size=self.chunk_size, camera_key=camera_key
+        )
         return out.squeeze(1) if images.ndim == 4 else out
 
 
@@ -1685,7 +1710,9 @@ class ImageTransforms(nn.Module):
         """The transform applied to every sample: a `BatchedRandomSubsetApply`, or `BatchedIdentity` when disabled."""
         return self.batched.tf
 
-    def forward(self, images: Tensor, generator: torch.Generator | None = None) -> Tensor:
+    def forward(
+        self, images: Tensor, generator: torch.Generator | None = None, *, camera_key: str | None = None
+    ) -> Tensor:
         """Transform one image or one stack of frames.
 
         Args:
@@ -1702,4 +1729,13 @@ class ImageTransforms(nn.Module):
         """
         if images.ndim not in (3, 4):
             raise ValueError(f"Expected (C, H, W) or (T, C, H, W) images, got shape {tuple(images.shape)}.")
-        return self.batched(images.unsqueeze(0), generator=generator).squeeze(0)
+        return self.batched(images.unsqueeze(0), generator=generator, camera_key=camera_key).squeeze(0)
+
+
+def apply_image_transforms(
+    image_transforms: Callable[[Tensor], Tensor], image: Tensor, camera_key: str
+) -> Tensor:
+    """Pass camera identity to LeRobot transforms while keeping arbitrary callables compatible."""
+    if isinstance(image_transforms, ImageTransforms):
+        return image_transforms(image, camera_key=camera_key)
+    return image_transforms(image)
