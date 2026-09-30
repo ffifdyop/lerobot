@@ -1402,9 +1402,11 @@ class PI05Policy(PreTrainedPolicy):
             state_masks=state_masks,
         )
 
-        # Truncate losses to actual action dimensions
-        original_action_dim = self.config.output_features[ACTION].shape[0]
-        losses = losses[:, :, :original_action_dim]
+        # By default, preserve LeRobot's loss over real action dimensions.
+        # OpenPI's JAX objective includes zero-padded SO-101 action dimensions.
+        if not self.config.train_on_padded_action_dims:
+            original_action_dim = self.config.output_features[ACTION].shape[0]
+            losses = losses[:, :, :original_action_dim]
 
         if prefix_mask is None:
             loss_per_dim = losses.mean(dim=(0, 1))

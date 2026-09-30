@@ -81,6 +81,10 @@ class PI05Config(PreTrainedConfig):
         DEFAULT_IMAGE_SIZE,
     )  # see openpi `preprocessing_pytorch.py`
 
+    # OpenPI trains against all padded action dimensions; other LeRobot recipes
+    # retain the historical loss over only the dataset's real action dimensions.
+    train_on_padded_action_dims: bool = False
+
     # Add empty images. Used to add empty cameras when no image features are present.
     empty_cameras: int = 0
 

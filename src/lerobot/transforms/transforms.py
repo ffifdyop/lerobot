@@ -27,6 +27,8 @@ from torchvision.transforms.v2 import (
     functional as F,  # noqa: N812
 )
 
+from .openpi import OpenPIImageAugmentation
+
 
 class RandomSubsetApply(Transform):
     """Apply a random subset of N transformations from a list of transformations.
@@ -73,7 +75,7 @@ class RandomSubsetApply(Transform):
 
         self.selected_transforms: list[Callable[..., Any]] = []
 
-    def forward(self, *inputs: Any) -> Any:
+    def forward(self, *inputs: Any, camera_key: str | None = None) -> Any:
         needs_unpacking = len(inputs) > 1
 
         selected_indices = torch.multinomial(torch.tensor(self.p), self.n_subset)
@@ -83,7 +85,12 @@ class RandomSubsetApply(Transform):
         self.selected_transforms = [self.transforms[i] for i in selected_indices]
 
         for transform in self.selected_transforms:
-            outputs = transform(*inputs)
+            if isinstance(transform, OpenPIImageAugmentation):
+                if camera_key is None:
+                    raise ValueError("OpenPI image augmentation requires a camera key")
+                outputs = transform(*inputs, camera_key=camera_key)
+            else:
+                outputs = transform(*inputs)
             inputs = outputs if needs_unpacking else (outputs,)
 
         return outputs
@@ -608,6 +615,7 @@ _CUSTOM_TRANSFORMS: dict[str, type[Transform]] = {
     "CoarseDropout": CoarseDropout,
     "GammaCorrection": GammaCorrection,
     "PlanckianJitter": PlanckianJitter,
+    "OpenPIImageAugmentation": OpenPIImageAugmentation,
 }
 
 
@@ -703,7 +711,6 @@ class ImageTransforms(Transform):
     def __init__(self, cfg: ImageTransformsConfig) -> None:
         super().__init__()
         self._cfg = cfg
-
         self.weights: list[float] = []
         self.transforms: dict[str, Transform] = {}
         for tf_name, tf_cfg in cfg.tfs.items():
@@ -724,5 +731,14 @@ class ImageTransforms(Transform):
                 random_order=cfg.random_order,
             )
 
-    def forward(self, *inputs: Any) -> Any:
+    def forward(self, *inputs: Any, camera_key: str | None = None) -> Any:
+        if isinstance(self.tf, RandomSubsetApply):
+            return self.tf(*inputs, camera_key=camera_key)
         return self.tf(*inputs)
+
+
+def apply_image_transforms(image_transforms: Callable, image: torch.Tensor, camera_key: str) -> torch.Tensor:
+    """Pass camera names to LeRobot transforms while preserving arbitrary callable transforms."""
+    if isinstance(image_transforms, ImageTransforms):
+        return image_transforms(image, camera_key=camera_key)
+    return image_transforms(image)

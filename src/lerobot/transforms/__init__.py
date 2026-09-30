@@ -26,6 +26,7 @@ from .transforms import (
     RandomShadow,
     RandomSubsetApply,
     SharpnessJitter,
+    apply_image_transforms,
     make_transform_from_config,
 )
 
@@ -33,6 +34,7 @@ from .transforms import (
 
 __all__ = [
     "CoarseDropout",
+    "apply_image_transforms",
     "GammaCorrection",
     "GaussianNoise",
     "GaussianPatchBrightness",

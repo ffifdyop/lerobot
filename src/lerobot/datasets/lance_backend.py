@@ -40,6 +40,7 @@ import numpy as np
 import torch
 
 from lerobot.configs.video import DEFAULT_DEPTH_UNIT, DepthEncoderConfig
+from lerobot.transforms import apply_image_transforms
 from lerobot.utils.import_utils import _lancedb_available, require_package
 
 if TYPE_CHECKING or _lancedb_available:
@@ -339,7 +340,7 @@ class LanceDatasetReader(BaseDatasetReader):
                 for cam_key in self.meta.camera_keys:
                     if cam_key in self.meta.depth_keys:
                         continue
-                    item[cam_key] = self._image_transforms(item[cam_key])
+                    item[cam_key] = apply_image_transforms(self._image_transforms, item[cam_key], cam_key)
         return items
 
     def _plan_file_windows(self, plans: list[dict]) -> dict[tuple, list[tuple[int, int]]]:

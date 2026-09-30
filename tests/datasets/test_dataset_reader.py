@@ -18,17 +18,21 @@
 import json
 import sys
 import types
+from unittest.mock import patch
 
 import pytest
 import torch
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
+from lerobot.configs.default import DatasetConfig
 from lerobot.datasets import LeRobotDataset, register_dataset_reader
 from lerobot.datasets.dataset_reader import DatasetReader
+from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.datasets.io_utils import hf_transform_to_torch
 from lerobot.datasets.language import LANGUAGE_EVENTS
 from lerobot.datasets.storage import _DATASET_READER_MODULES, DEFAULT_STORAGE_FORMAT, localize_remote_root
+from lerobot.transforms import ImageTransformConfig, ImageTransforms, ImageTransformsConfig
 from lerobot.utils.import_utils import get_safe_default_video_backend
 from tests.fixtures.constants import DEFAULT_FPS, DUMMY_REPO_ID
 
@@ -171,6 +175,72 @@ def test_image_transforms_are_applied(tmp_path, lerobot_dataset_factory):
     num_cameras = len(dataset.meta.camera_keys)
     if num_cameras > 0:
         assert transform_called["count"] >= 1
+
+
+def test_openpi_image_transforms_receive_camera_keys(tmp_path, lerobot_dataset_factory):
+    camera_feature = {"shape": (64, 96, 3), "names": ["height", "width", "channels"]}
+    transforms = ImageTransforms(
+        ImageTransformsConfig(
+            enable=True,
+            max_num_transforms=1,
+            tfs={"openpi": ImageTransformConfig(type="OpenPIImageAugmentation", kwargs={"color_probability": 0.0})},
+        )
+    )
+    dataset = lerobot_dataset_factory(
+        root=tmp_path / "ds",
+        total_episodes=1,
+        total_frames=5,
+        use_videos=False,
+        camera_features={
+            "observation.images.top": camera_feature,
+            "observation.images.left_wrist": camera_feature,
+        },
+        image_transforms=transforms,
+    )
+    openpi_transform = transforms.transforms["openpi"]
+    with patch.object(openpi_transform, "forward", wraps=openpi_transform.forward) as augment:
+        item = dataset[0]
+        items = dataset.__getitems__([0, 1])
+
+    assert {call.kwargs["camera_key"] for call in augment.call_args_list} == {
+        "observation.images.top", "observation.images.left_wrist"
+    }
+    assert item["observation.images.top"].shape == (3, 224, 224)
+    assert item["observation.images.left_wrist"].shape == (3, 224, 224)
+    assert len(items) == 2
+
+
+def test_openpi_transforms_only_on_training_split(tmp_path, lerobot_dataset_factory):
+    from types import SimpleNamespace
+
+    root = tmp_path / "ds"
+    lerobot_dataset_factory(root=root, total_episodes=3, total_frames=15, use_videos=False)
+    config = SimpleNamespace(
+        dataset=DatasetConfig(
+            repo_id=DUMMY_REPO_ID,
+            root=str(root),
+            eval_split=1 / 3,
+            image_transforms=ImageTransformsConfig(
+                enable=True,
+                max_num_transforms=1,
+                tfs={
+                    "openpi": ImageTransformConfig(
+                        type="OpenPIImageAugmentation", kwargs={"color_probability": 0.0}
+                    )
+                },
+            ),
+        ),
+        trainable_config=None,
+        rename_map=None,
+        tolerance_s=1e-4,
+    )
+    with patch("lerobot.datasets.factory.resolve_delta_timestamps", return_value=None):
+        train_dataset, eval_dataset = make_train_eval_datasets(config)
+
+    assert isinstance(train_dataset.image_transforms, ImageTransforms)
+    assert eval_dataset.image_transforms is None
+    assert train_dataset[0]["laptop"].shape == (3, 224, 224)
+    assert eval_dataset[0]["laptop"].shape[-2:] != (224, 224)
 
 
 # ── File paths ───────────────────────────────────────────────────────

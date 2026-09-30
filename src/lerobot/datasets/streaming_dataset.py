@@ -24,6 +24,7 @@ import torch
 from datasets import load_dataset
 
 from lerobot.configs import DEFAULT_DEPTH_UNIT, DEPTH_METER_UNIT, DepthEncoderConfig
+from lerobot.transforms import apply_image_transforms
 from lerobot.utils.constants import HF_LEROBOT_HOME, LOOKAHEAD_BACKTRACKTABLE, LOOKBACK_BACKTRACKTABLE
 
 from .dataset_metadata import CODEBASE_VERSION, LeRobotDatasetMetadata
@@ -566,7 +567,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             if self.image_transforms is not None:
                 image_keys = self.meta.camera_keys
                 for cam in image_keys:
-                    video_frames[cam] = self.image_transforms(video_frames[cam])
+                    video_frames[cam] = apply_image_transforms(self.image_transforms, video_frames[cam], cam)
 
             updates.append(video_frames)
 

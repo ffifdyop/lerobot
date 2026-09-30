@@ -28,6 +28,7 @@ from lerobot.configs import (
     DEPTH_METER_UNIT,
     DepthEncoderConfig,
 )
+from lerobot.transforms import apply_image_transforms
 
 from .dataset_metadata import LeRobotDatasetMetadata
 from .depth_utils import MM_PER_METRE, dequantize_depth
@@ -447,7 +448,7 @@ class DatasetReader(BaseDatasetReader):
             for cam in self._meta.camera_keys:
                 if cam in self._meta.depth_keys:
                     continue
-                item[cam] = self._image_transforms(item[cam])
+                item[cam] = apply_image_transforms(self._image_transforms, item[cam], cam)
 
         # Convert depth features to the output unit.
         for key, stored_unit in self._image_depth_units.items():
