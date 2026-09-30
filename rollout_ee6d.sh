@@ -21,9 +21,12 @@ export ROLLOUT_CHECKPOINT="models/lehome/train/smolvla/smolvla-real_720p_ft_ee6d
 # 任务 prompt(需与训练时一致)
 export ROLLOUT_TASK="fold the garment on the table"
 
-# 串口
-export LEFT_FOLLOWER_PORT="/dev/ttyACM2"
-export RIGHT_FOLLOWER_PORT="/dev/ttyACM3"
+# 串口：一律用 /dev/serial/by-id/，不要写 /dev/ttyACM<N>（编号按接入顺序分配，
+# 拔插一次就可能左右互换 → lerobot 拿错标定文件校验电机 → 弹出重建标定提示，
+# 而按回车/输 c 都会写坏 EPROM 或标定文件）。by-id 按序列号固定。
+# 若路径不存在：ls -la /dev/serial/by-id/
+export LEFT_FOLLOWER_PORT="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B3D042915-if00"
+export RIGHT_FOLLOWER_PORT="/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B3D046378-if00"
 
 # 相机
 export LEFT_WRIST_CAM="/dev/video0"
