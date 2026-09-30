@@ -20,6 +20,43 @@ _避免_：episode（仅对录制类策略才有意义）
 **Control Tick（控制节拍）**：
 控制循环的一步（在动作块内做插值）。较慢的策略节拍驱动较快的控制节拍。
 
+**Control Source（控制来源）**：
+当前拥有机器人动作决定权的一方，只能是 Policy 或 Human；同一控制节拍不得混合两个来源。
+_避免_：控制模式（容易与机器人的关节/末端执行器控制模式混淆）
+
+**Control Phase（控制阶段）**：
+一次 rollout 运行中控制权所处的阶段：Policy、Human、Resuming、Paused 或 Fault。阶段描述运行状态，Control Source 描述有效动作的来源，两者不可互换。
+
+### 人工接管
+
+**Human Takeover（人工接管）**：
+rollout 不结束的前提下，Control Source 从 Policy 切换到 Human，使主臂动作取代策略动作成为机器人指令。
+_避免_：急停、混合控制
+
+**Leader–Follower Synchronization（主从臂同步）**：
+Policy 控制期间让主臂跟随从臂实际姿态的关系，使人工接管开始时两者已经对齐。它不是人工控制，也不表示主臂动作正在驱动从臂。
+_避免_：遥操作、主臂接管
+
+**Policy Proposal（策略候选动作）**：
+策略针对当前观测提出、但尚未获得执行权的动作。Human、Paused 或 Fault 阶段产生的 Policy Proposal 不得进入机器人可执行动作队列。
+_避免_：Policy Action（无法区分候选动作与已选中的策略动作）
+
+**Selected Action（选中动作）**：
+控制仲裁器在 Policy Proposal 与人工动作之间选出的训练动作；它位于策略动作空间，尚未包含机器人侧安全裁剪或变换。
+_避免_：Executed Action
+
+**Executed Action（实际发送动作）**：
+机器人动作处理和安全裁剪之后，最终发送到机器人接口的动作。它可能与 Selected Action 数值或动作空间不同。
+_避免_：Selected Action、Policy Proposal
+
+**Shadow Policy（影子策略）**：
+在 Policy 不拥有控制权时继续观察并产生 Policy Proposal、但永远不向机器人发送动作的策略运行方式。
+_避免_：并行控制、备用控制器
+
+**Rollout Fault（Rollout 故障）**：
+控制完整性无法继续保证、必须停止产生新机器人动作的锁存状态。故障可分为允许人工确认后恢复的 Recoverable Fault，以及必须结束当前 episode 的 Fatal Fault。
+_避免_：Pause（主动暂停不是故障）、Warning
+
 ### 策略与推理
 
 **View Ablation（视角消融）**：

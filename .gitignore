@@ -182,6 +182,10 @@ Datasets/
 
 # models
 models/lehome
+models/lerobot
+
+# performance analysis
+profiles/
 
 # openspec skills
 .claude/
@@ -190,3 +194,6 @@ models/lehome
 .github/prompts/
 .github/skills/
 .agents/
+
+# copy
+*.orig
