@@ -20,7 +20,7 @@ import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import draccus
 from huggingface_hub import hf_hub_download
@@ -38,6 +38,9 @@ from . import parser
 from .default import DatasetConfig, EMAConfig, EvalConfig, JobConfig, PeftConfig, WandBConfig
 from .policies import PreTrainedConfig
 from .rewards import RewardModelConfig
+
+if TYPE_CHECKING:
+    from lerobot.policies.pi05.configuration_pi05 import PI05Config
 
 TRAIN_CONFIG_NAME = "train_config.json"
 
@@ -371,6 +374,16 @@ class TrainPipelineConfig(HubMixin):
                 )
             if self.peft is not None:
                 raise ValueError("PEFT is not supported under sharded training yet.")
+            if self.policy is not None and self.policy.type == "pi05":
+                cast("PI05Config", self.policy).validate_fsdp()
+                if (
+                    self.accelerator.fsdp.wrap_modules is not None
+                    or self.accelerator.fsdp.min_num_params is not None
+                ):
+                    raise ValueError(
+                        "PI05 FSDP requires its policy-defined wrap units; leave "
+                        "accelerator.fsdp.wrap_modules and min_num_params unset."
+                    )
             if self.is_reward_model_training:
                 raise ValueError(
                     "Reward-model training is not supported under sharded training yet "

@@ -65,6 +65,7 @@ from ..common.vla_utils import (
 from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
+from .fsdp import canonical_pi05_state_dict, prepare_joint_layers
 from .memory import encode_video_with_mem, sample_observation_history
 
 
@@ -465,8 +466,18 @@ class PaliGemmaWithExpertModel(
             ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
 
             # Process all layers with gradient checkpointing if enabled
-            for layers in zip(paligemma_layers, gemma_expert_layers, strict=True):
-                if use_gradient_checkpointing:
+            joint_layers = getattr(self, "joint_layers", None)
+            for index, layers in enumerate(zip(paligemma_layers, gemma_expert_layers, strict=True)):
+                if joint_layers is not None:
+                    inputs_embeds = joint_layers[index](
+                        inputs_embeds,
+                        attention_mask,
+                        position_ids,
+                        adarms_cond,
+                        rotary_emb=rotary_emb,
+                        checkpointing=use_gradient_checkpointing,
+                    )
+                elif use_gradient_checkpointing:
                     inputs_embeds = torch.utils.checkpoint.checkpoint(
                         compute_layer_complete,
                         inputs_embeds,
@@ -757,9 +768,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )
             return suffix_out
 
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-        )
+        if hasattr(self.paligemma_with_expert, "joint_layers"):
+            # Each joint layer already owns its checkpoint. Recomputing this entire
+            # stack as well would re-enter every FSDP unit a second time.
+            suffix_out = forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond)
+        else:
+            suffix_out = self._apply_checkpoint(
+                forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+            )
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -910,6 +926,35 @@ class PI05Policy(PreTrainedPolicy):
 
     config_class = PI05Config
     name = "pi05"
+    _fsdp_wrap_modules = ["PI05JointDecoderLayer", "SiglipEncoderLayer"]
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        # Accelerate FSDP2 gives this large embedding its own communication group.
+        # Do not wrap all Embedding classes: vision positional weights may be read
+        # directly during interpolation, without entering their forward hooks.
+        return self.model.paligemma_with_expert.paligemma.model.language_model.embed_tokens
+
+    def prepare_for_fsdp(self) -> None:
+        """Install joint decoder boundaries without changing the ordinary PI05 model tree."""
+        self.config.validate_fsdp()
+        core = self.model.paligemma_with_expert
+        embedding = core.paligemma.model.language_model.embed_tokens
+        if embedding.weight is core.paligemma.lm_head.weight:
+            raise ValueError("PI05 FSDP requires an untied language embedding and lm_head.")
+        prepare_joint_layers(core, compute_layer_complete)
+
+    def _prepare_state_dict_for_save(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        state_dict = canonical_pi05_state_dict(state_dict)
+        # Uneven FSDP shards (e.g. SigLIP's [1, 1, D] pooling probe) can gather
+        # as contiguous views of padded storage. safetensors rejects these views;
+        # .contiguous() would return the same oversized storage, so clone them.
+        return {
+            name: value.clone()
+            if value.storage_offset()
+            or value.untyped_storage().nbytes() != value.numel() * value.element_size()
+            else value
+            for name, value in state_dict.items()
+        }
 
     def supports_rtc(self) -> bool:
         return True
@@ -1061,6 +1106,8 @@ class PI05Policy(PreTrainedPolicy):
         return model
 
     def _prepare_pretrained_state_dict(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        # Also accepts weights merged from a DCP checkpoint, which retains runtime names.
+        state_dict = canonical_pi05_state_dict(state_dict)
         # MEM's continuous proprioceptive projection is new relative to
         # lerobot/pi05_base. Preserve its fresh initialization on first load,
         # while loading learned values from subsequent MEM checkpoints.

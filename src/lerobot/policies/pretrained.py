@@ -115,6 +115,17 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 "checkpoint-conditional value), otherwise the text head is never used."
             )
 
+    def prepare_for_fsdp(self) -> None:
+        """Install policy-specific boundaries before sharding, preserving parameter identities.
+
+        The optimizer may already exist. Implementations must be idempotent and must
+        not replace parameters or change their requires_grad flags.
+        """
+
+    def _prepare_state_dict_for_save(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Convert runtime-only names to the portable pretrained schema, after gathering."""
+        return state_dict
+
     def _save_pretrained(self, save_directory: Path) -> None:
         """Serialize this policy's parameters (and config) into `save_directory`.
 
@@ -140,6 +151,7 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
             # Non-sharded multi-rank (DDP): every rank holds a full dict — the explicit rank
             # gate prevents N ranks racing on the same files. Single process: never taken.
             return
+        state_dict = model_to_save._prepare_state_dict_for_save(state_dict)
         self.config._save_pretrained(save_directory)
         save_torch_state_dict(state_dict, str(save_directory), max_shard_size=_SINGLE_FILE_SHARD_SIZE)
 

@@ -19,10 +19,10 @@ Two artifact channels with distinct owners:
 
 - the **distributable** ``model.safetensors``: produced by ``PreTrainedPolicy.save_pretrained``
   through :func:`full_model_state_dict` — a collective full gather when the model is sharded;
-- the **resume** channel (sharded runs): torch DCP directories written/read through accelerate's
-  ``save/load_fsdp_model`` and ``save/load_fsdp_optimizer`` (``pytorch_model_fsdp_0/`` and
-  ``optimizer_0/``, names imported from accelerate constants), which reshard on load across
-  topology changes.
+- the **resume** channel (sharded runs): torch DCP directories written through accelerate
+  (``pytorch_model_fsdp_0/`` and ``optimizer_0/``, names imported from accelerate constants).
+  Model loading uses accelerate; optimizer loading uses torch DCP directly to preserve
+  lazy optimizer state for unused parameters. Both reshard on load across topology changes.
 
 Every function that touches sharded state is a collective and must run on ALL ranks.
 """
@@ -161,14 +161,43 @@ def load_sharded_optimizer(
         model (nn.Module): The prepared (sharded) model the optimizer state is keyed by.
         input_dir (Path): The directory containing the `optimizer_0/` shard subdirectory.
     """
-    from accelerate.utils import load_fsdp_optimizer
     from accelerate.utils.constants import OPTIMIZER_NAME
-
-    # Exact shard directory for the same reason as load_sharded_model: accelerate's substring
-    # check ("optimizer" in the path) would misread e.g. --job_name=optimizer_sweep run paths.
-    load_fsdp_optimizer(
-        _fsdp_plugin(accelerator), accelerator, optimizer, model, str(input_dir / f"{OPTIMIZER_NAME}_0")
+    from torch.distributed.checkpoint import FileSystemReader, load
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        get_optimizer_state_dict,
+        set_optimizer_state_dict,
     )
+
+    plugin = _fsdp_plugin(accelerator)
+    accelerator.wait_for_everyone()
+    reader = FileSystemReader(str(input_dir / f"{OPTIMIZER_NAME}_0"))
+    metadata = reader.read_metadata()
+    if metadata.planner_data is None:
+        raise ValueError("Optimizer DCP checkpoint lacks the nested state metadata required for loading.")
+    # Adam initializes state lazily: PI05's unused LM heads (among other parameters)
+    # never acquire moments. get_optimizer_state_dict on a fresh optimizer instead
+    # initializes ALL parameters. Accelerate's stock loader then requires nonexistent
+    # moment keys. Use the saved parameter-state membership, retaining strict loading
+    # of every field for parameters that DO have state (a missing moment still fails).
+    saved_parameters = {
+        path[2]
+        for path in metadata.planner_data.values()
+        if len(path) >= 3 and tuple(path[:2]) == ("optimizer", "state")
+    }
+    options = StateDictOptions(
+        full_state_dict=False,
+        cpu_offload=getattr(getattr(plugin, "state_dict_config", None), "offload_to_cpu", False),
+        # Missing WHOLE parameter states are intentional lazy Adam state. DCP's
+        # load planner below remains strict about every requested tensor/field.
+        strict=False,
+    )
+    state_dict = get_optimizer_state_dict(model, optimizer, options=options)
+    state_dict["state"] = {
+        name: state for name, state in state_dict["state"].items() if name in saved_parameters
+    }
+    load({"optimizer": state_dict}, storage_reader=reader)
+    set_optimizer_state_dict(model, optimizer, state_dict, options=options)
 
 
 def dcp_to_safetensors(dcp_dir: Path, output_dir: Path, *, delete_dcp: bool = False) -> Path:

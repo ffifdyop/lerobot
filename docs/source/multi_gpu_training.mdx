@@ -110,6 +110,26 @@ torchrun --nnodes=2 --nproc-per-node=8 ... $(which lerobot-train) \
   --parallelism.dp_replicate=2 --parallelism.dp_shard=8 ...
 ```
 
+## Stopping training
+
+Press **Ctrl+C once** in the foreground `torchrun` terminal. Training ranks record
+SIGINT/SIGTERM as a stop request, finish the current batch, and agree at a shared
+boundary before exiting. The same mechanism works when only one training rank
+receives the signal. DataLoader children ignore SIGINT so they can continue serving
+the batch while their trainer coordinates shutdown.
+
+Process-group cleanup runs on normal completion, coordinated interrupts, and
+exceptions. Cleanup adds no barrier, since another rank may already have failed.
+An interrupted trainer exits with status 130 for SIGINT or 143 for SIGTERM;
+`torchrun` may also print its signal/worker-exit report.
+
+Interrupting does not create an additional checkpoint or publish the model. Resume
+from the last completed checkpoint. A signal during initialization, evaluation,
+or a checkpoint operation may take longer to reach a shared stopping boundary.
+SIGKILL, a nonresponsive rank/driver, and `torchrun`'s forced-termination timeout
+cannot be handled by Python cleanup; avoid repeatedly pressing Ctrl+C while the
+workers are shutting down.
+
 ## Checkpoints
 
 Every checkpoint contains a `pretrained_model/` directory and a `training_state/` directory:

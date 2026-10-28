@@ -122,6 +122,23 @@ class PI05Config(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
+    def validate_fsdp(self) -> None:
+        """Fail before model allocation for combinations outside the initial FSDP scope."""
+        if self.compile_model:
+            raise ValueError("PI05 FSDP does not support policy.compile_model; set it to false.")
+        if self.use_visual_memory:
+            raise ValueError("PI05 FSDP does not support visual memory yet.")
+        if self.freeze_vision_encoder or self.train_expert_only:
+            raise ValueError(
+                "PI05 FSDP currently supports full fine-tuning only: set "
+                "policy.freeze_vision_encoder=false and policy.train_expert_only=false."
+            )
+        if self.dtype != "float32":
+            raise ValueError(
+                "PI05 FSDP requires policy.dtype=float32; select bf16 computation with "
+                "accelerator.mixed_precision=bf16."
+            )
+
     def __post_init__(self):
         super().__post_init__()
 

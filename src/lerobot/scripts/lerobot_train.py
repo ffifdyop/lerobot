@@ -69,6 +69,7 @@ from lerobot.distributed import (
     make_accelerator,
     set_fsdp_wrap_modules,
 )
+from lerobot.distributed.shutdown import TrainingInterrupted, TrainingShutdown, init_training_data_worker
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -346,6 +347,7 @@ def make_dataloaders(
         pin_memory=device_type == "cuda",
         drop_last=False,
         collate_fn=collate_fn,
+        worker_init_fn=init_training_data_worker,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
         multiprocessing_context=cfg.dataloader_multiprocessing_context if cfg.num_workers > 0 else None,
@@ -374,6 +376,7 @@ def make_dataloaders(
             pin_memory=device_type == "cuda",
             drop_last=False,
             collate_fn=eval_collate_fn,
+            worker_init_fn=init_training_data_worker,
             prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
             persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
             multiprocessing_context=cfg.dataloader_multiprocessing_context if cfg.num_workers > 0 else None,
@@ -411,7 +414,19 @@ def train(cfg: TrainPipelineConfig):
     # The factory is the ONLY accelerate configuration site: it guards against env-var
     # interference, resolves the declared parallelism degrees against the launched world, and
     # builds the Accelerator from the config mirrors.
-    accelerator = make_accelerator(cfg)
+    try:
+        with TrainingShutdown() as shutdown:
+            accelerator = make_accelerator(cfg)
+            shutdown.accelerator = accelerator
+            shutdown.raise_if_requested(accelerator.device)
+            _train(cfg, accelerator, shutdown)
+    except TrainingInterrupted as exc:
+        logging.warning("%s. Resume from the last saved checkpoint.", exc)
+        raise SystemExit(128 + exc.signum) from None
+
+
+def _train(cfg: TrainPipelineConfig, accelerator: "Accelerator", shutdown: TrainingShutdown) -> None:
+    """Run local training within the signal/cleanup scope owned by ``train``."""
     parallel_dims = ParallelDims.from_config(
         cfg.parallelism, accelerator.num_processes, accelerator.device.type
     )
@@ -723,6 +738,7 @@ def train(cfg: TrainPipelineConfig):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    shutdown.raise_if_requested(device)
     for _ in range(step, cfg.steps):
         step_start = time.perf_counter()
         batch = next(dl_iter)
@@ -755,6 +771,9 @@ def train(cfg: TrainPipelineConfig):
         if is_main_process():
             progbar.update(1)
         train_tracker.step()
+        # Every rank checks, even if only one received the signal. Finish this
+        # batch, then stop before starting logging/evaluation/checkpoint collectives.
+        shutdown.raise_if_requested(device)
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
         is_saving_step = should_save_checkpoint(step, cfg.save_freq, cfg.steps)
         is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
@@ -905,6 +924,8 @@ def train(cfg: TrainPipelineConfig):
         progbar.close()
         logging.info("End of training")
 
+    # A signal during the final evaluation/save must not trigger publication.
+    shutdown.raise_if_requested(device)
     # --- publish (collective-safe: all ranks; the model commit gathers sharded weights) ---------
     if getattr(active_cfg, "push_to_hub", False):
         unwrapped = accelerator.unwrap_model(policy)
@@ -937,9 +958,7 @@ def train(cfg: TrainPipelineConfig):
             finally:
                 unwrapped.config.repo_id = orig_repo_id
 
-    # Properly clean up the distributed process group
-    accelerator.wait_for_everyone()
-    accelerator.end_training()
+    # TrainingShutdown owns cleanup on success, errors, and coordinated interrupts.
 
 
 def _remote_target_in_argv() -> bool:

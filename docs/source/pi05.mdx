@@ -175,6 +175,74 @@ lerobot-train \
   - [lerobot/pi05_base](https://huggingface.co/lerobot/pi05_base)
   - [lerobot/pi05_libero_base](https://huggingface.co/lerobot/pi05_libero_base) (specifically trained on the Libero dataset)
 
+### Full fine-tuning with FSDP2
+
+PI05 can use the training framework's FSDP2 path for full fine-tuning. The trainer
+groups each pair of VLM and action-expert decoder layers into one sharding unit,
+shards SigLIP encoder layers separately, and gives the language embedding its own
+unit. This runtime restructuring preserves ordinary DDP and LoRA model paths.
+
+For the local SO-101 recipe, explicitly disable LoRA and select the shard count:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,2 \
+USE_LORA=false FSDP_DEVICES=2 NUM_GPUS=2 BATCH_SIZE=6 \
+  bash examples/pi05/train_so101_bimanual_folding_cloth.sh
+```
+
+Select two available GPUs for `CUDA_VISIBLE_DEVICES`; PCI ordering makes these
+indices match `nvidia-smi` on this workstation.
+The batch size is per GPU: this example has a global batch of 12. The equivalent
+trainer flags are `--parallelism.dp_shard=2 --parallelism.dp_replicate=1`.
+`FSDP_DEVICES` must divide `NUM_GPUS`; larger worlds can replicate shard groups.
+
+Use `--policy.dtype=float32 --accelerator.mixed_precision=bf16` (or `no` for FP32
+computation). `--policy.gradient_checkpointing=true` recomputes inside each joint
+layer, after FSDP's input dtype conversion. The initial scope requires full fine-tuning, no PEFT,
+no visual MEM, no `policy.compile_model`, and the policy's default wrap units.
+The framework also requires EMA off and `--env_eval_freq=0`; offline loss evaluation
+on every rank remains available. The SO-101 recipe already sets these options.
+
+Full `model.safetensors` exports retain the ordinary PI05 weight names and load for
+single-GPU inference. DCP model/optimizer checkpoints use the prepared runtime tree;
+resume them through `--resume=true --config_path=.../pretrained_model/train_config.json`.
+Weights merged with `lerobot-convert-dcp` are also accepted by the PI05 loader.
+See [multi-GPU training](multi_gpu_training) for checkpoint format options.
+For a controlled stop, press Ctrl+C once and allow the current batch and distributed
+cleanup to finish; see [stopping training](multi_gpu_training#stopping-training).
+
+Initialization still builds the full model before sharding. FSDP does not guarantee
+that this initialization peak, activations, or peak total memory shrink by the shard
+count. Measure peak allocated memory and throughput against full fine-tuning with
+DDP at the same global batch before selecting a production batch size.
+
+The focused CUDA test exercises a small PI05 with the real model, Accelerate FSDP2,
+FP32/BF16, gradient checkpointing, weight export and optimizer restore:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,2 \
+  uv run pytest tests/distributed/test_pi05_fsdp_multigpu.py -v -k 'not gloo'
+```
+
+It skips when fewer than two CUDA GPUs are available. Passing CPU structure tests
+alone does not establish CUDA correctness or a measured memory/speed improvement.
+
+To compare memory and compute throughput with full-size random PI05 weights and
+resident synthetic inputs, run each layout in a fresh process with identical settings:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,2 \
+  uv run torchrun --standalone --nproc-per-node=2 benchmarks/benchmark_pi05_fsdp.py \
+  --dp-shard=1 --output /tmp/pi05-ddp.json
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,2 \
+  uv run torchrun --standalone --nproc-per-node=2 benchmarks/benchmark_pi05_fsdp.py \
+  --dp-shard=2 --output /tmp/pi05-fsdp.json
+```
+
+This measures five optimizer steps (two warmup, three timed), with three 224px
+cameras, 200 language tokens, action horizon 50 and batch size 6 per GPU. It excludes
+dataset I/O and checkpoint costs; it does not measure training quality.
+
 ### Optional training-time RTC
 
 Pi05 can optionally learn action-prefix conditioning for efficient

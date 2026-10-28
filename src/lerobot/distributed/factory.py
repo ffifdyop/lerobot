@@ -122,7 +122,12 @@ def set_fsdp_wrap_modules(accelerator: "Accelerator", policy: "PreTrainedPolicy"
             nor a policy declaration supplies wrap-unit class names.
     """
     plugin = getattr(accelerator.state, "fsdp_plugin", None)
-    if plugin is None or plugin.min_num_params:
+    if plugin is None:
+        return
+    prepare_policy = getattr(policy, "prepare_for_fsdp", None)
+    if prepare_policy is not None:
+        prepare_policy()
+    if plugin.min_num_params:
         return
     if plugin.transformer_cls_names_to_wrap:  # user override, set at build time
         return
