@@ -50,6 +50,7 @@ else:
     sdpa_attention_forward = None
     PaliGemmaForConditionalGenerationWithPiGemma = None
 from lerobot.configs import PreTrainedConfig
+from lerobot.utils.checkpoint_compat import canonical_pi05_state_dict
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
@@ -1253,6 +1254,7 @@ class PI05Policy(PreTrainedPolicy):
         return self._prepare_pretrained_state_dict(remapped_state_dict)
 
     def _prepare_pretrained_state_dict(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        state_dict = canonical_pi05_state_dict(state_dict)
         # MEM's continuous proprioceptive projection is new relative to
         # lerobot/pi05_base. Preserve its fresh initialization on first load,
         # while loading learned values from subsequent MEM checkpoints.

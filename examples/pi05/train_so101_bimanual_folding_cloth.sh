@@ -9,6 +9,11 @@
 #   NUM_GPUS=2 BATCH_SIZE=6 STEPS=10000 \
 #     ./examples/pi05/train_so101_bimanual_folding_cloth.sh
 #
+# This recipe validates full fine-tuning with upstream FSDP2 (two shards, global batch remains 12):
+#
+#   USE_LORA=false FSDP_DEVICES=2 NUM_GPUS=2 BATCH_SIZE=6 \
+#     ./examples/pi05/train_so101_bimanual_folding_cloth.sh
+#
 # Extra command-line arguments are forwarded to lerobot-train. To train the
 # entire model on a large-memory GPU, use:
 #
@@ -30,6 +35,7 @@ JOB_NAME="${JOB_NAME:-pi05_so101_bimanual_folding_cloth}"
 BATCH_SIZE="${BATCH_SIZE:-6}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 NUM_GPUS="${NUM_GPUS:-2}"
+FSDP_DEVICES="${FSDP_DEVICES:-1}"
 STEPS="${STEPS:-40000}"
 SAVE_FREQ="${SAVE_FREQ:-20000}"
 SEED="${SEED:-42}"
@@ -40,6 +46,28 @@ MAX_EVAL_SAMPLES="${MAX_EVAL_SAMPLES:-0}"
 
 TRAIN_EXPERT_ONLY="${TRAIN_EXPERT_ONLY:-false}"
 FREEZE_VISION_ENCODER="${FREEZE_VISION_ENCODER:-false}"
+PARALLEL_ARGS=()
+if [[ ! "${FSDP_DEVICES}" =~ ^[1-9][0-9]*$ || ! "${NUM_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "FSDP_DEVICES and NUM_GPUS must be positive integers." >&2
+    exit 1
+fi
+if (( FSDP_DEVICES > 1 )); then
+    if (( NUM_GPUS % FSDP_DEVICES != 0 )); then
+        echo "NUM_GPUS must be divisible by FSDP_DEVICES." >&2
+        exit 1
+    fi
+    if [[ "${USE_LORA:-false}" != "false" || "${TRAIN_EXPERT_ONLY}" != "false" || "${FREEZE_VISION_ENCODER}" != "false" ]]; then
+        echo "This FSDP recipe covers full fine-tuning: use USE_LORA=false TRAIN_EXPERT_ONLY=false FREEZE_VISION_ENCODER=false." >&2
+        exit 1
+    fi
+    # Scope of this tested recipe, not a restriction on upstream FSDP's PEFT/EMA support.
+    # PI05's decoder projections are called directly, so keep them in the root FSDP unit.
+    PARALLEL_ARGS=(
+        --accelerator.fsdp.wrap_modules='["SiglipEncoderLayer"]'
+        --parallelism.dp_shard="${FSDP_DEVICES}"
+        --parallelism.dp_replicate="$((NUM_GPUS / FSDP_DEVICES))"
+    )
+fi
 OPENPI_AUGMENTATION="${OPENPI_AUGMENTATION:-true}"
 OPENPI_AUG_CROP_SCALE="${OPENPI_AUG_CROP_SCALE:-0.95}"
 OPENPI_AUG_ROTATION_DEGREES="${OPENPI_AUG_ROTATION_DEGREES:-5.0}"
@@ -82,15 +110,18 @@ fi
 echo "HF offline mode: HF_HUB_OFFLINE=${HF_HUB_OFFLINE}, TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE}"
 echo "Pretrained snapshot: ${PRETRAINED_PATH}"
 echo "Distributed training: ${NUM_GPUS} GPUs, per-GPU batch=${BATCH_SIZE}, global batch=$((NUM_GPUS * BATCH_SIZE))"
+echo "FSDP shard group size: ${FSDP_DEVICES} (1 uses DDP)"
 
 if [[ "${OPENPI_AUGMENTATION}" != "true" && "${OPENPI_AUGMENTATION}" != "false" ]]; then
     echo "OPENPI_AUGMENTATION must be true or false, got: ${OPENPI_AUGMENTATION}" >&2
     exit 1
 fi
 
+# EMA stays off by omitting --ema.* (the upstream default is None). Trackio logs locally.
 # Match OpenPI's JAX training precision: retain trainable parameters, gradients, and
 # optimizer state in FP32, while AMP runs eligible forward/backward ops in BF16.
 torchrun --standalone --nproc-per-node="${NUM_GPUS}" "$(command -v lerobot-train)" \
+    "${PARALLEL_ARGS[@]}" \
     --dataset.repo_id="${DATASET_REPO_ID}" \
     --dataset.root="${DATASET_ROOT}" \
     --dataset.return_uint8=true \
@@ -99,6 +130,7 @@ torchrun --standalone --nproc-per-node="${NUM_GPUS}" "$(command -v lerobot-train
     --policy.pretrained_path="${PRETRAINED_PATH}" \
     --policy.normalization_mapping='{"ACTION":"QUANTILES","STATE":"QUANTILES","VISUAL":"IDENTITY"}' \
     --dataset.image_transforms.enable="${OPENPI_AUGMENTATION}" \
+    --dataset.image_transforms.backend=dataloader \
     --dataset.image_transforms.max_num_transforms=1 \
     --dataset.image_transforms.tfs="{\"openpi\":{\"type\":\"OpenPIImageAugmentation\",\"kwargs\":{\"crop_scale\":${OPENPI_AUG_CROP_SCALE},\"rotation_degrees\":${OPENPI_AUG_ROTATION_DEGREES},\"color_probability\":${OPENPI_AUG_COLOR_PROBABILITY},\"brightness\":${OPENPI_AUG_BRIGHTNESS},\"contrast\":${OPENPI_AUG_CONTRAST},\"hue\":${OPENPI_AUG_HUE}}}}" \
     --policy.train_on_padded_action_dims=true \
@@ -122,13 +154,9 @@ torchrun --standalone --nproc-per-node="${NUM_GPUS}" "$(command -v lerobot-train
     --policy.scheduler_warmup_steps=1000 \
     --policy.scheduler_decay_steps=40000 \
     --policy.scheduler_decay_lr=4e-6 \
-    --ema.enable=false \
-    --ema.decay=0.999 \
-    --ema.use_for_eval=false \
-    --wandb.enable=true \
-    --wandb.project=lehome-pi05 \
-    --wandb.entity=2943872339-zhejiang-university \
-    --wandb.disable_artifact=true \
+    --trackio.enable=true \
+    --trackio.project=lehome-pi05 \
+    --trackio.disable_artifact=true \
     --output_dir="${OUTPUT_DIR}" \
     --job_name="${JOB_NAME}" \
     --batch_size="${BATCH_SIZE}" \

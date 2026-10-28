@@ -39,7 +39,6 @@ import torch
 from datasets.features.features import register_feature
 from PIL import Image
 
-from lerobot.transforms import apply_image_transforms
 from lerobot.configs import (
     DEPTH_METER_UNIT,
     DepthEncoderConfig,
@@ -48,6 +47,7 @@ from lerobot.configs import (
     depth_encoder_defaults,
     rgb_encoder_defaults,
 )
+from lerobot.transforms import apply_image_transforms
 from lerobot.utils.import_utils import get_safe_default_video_backend
 
 from .depth_utils import MM_PER_METRE, dequantize_depth, quantize_depth

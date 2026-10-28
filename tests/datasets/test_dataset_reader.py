@@ -185,7 +185,11 @@ def test_openpi_image_transforms_receive_camera_keys(tmp_path, lerobot_dataset_f
         ImageTransformsConfig(
             enable=True,
             max_num_transforms=1,
-            tfs={"openpi": ImageTransformConfig(type="OpenPIImageAugmentation", kwargs={"color_probability": 0.0})},
+            tfs={
+                "openpi": ImageTransformConfig(
+                    type="OpenPIImageAugmentation", kwargs={"color_probability": 0.0}
+                )
+            },
         )
     )
     dataset = lerobot_dataset_factory(
@@ -205,7 +209,8 @@ def test_openpi_image_transforms_receive_camera_keys(tmp_path, lerobot_dataset_f
         items = dataset.__getitems__([0, 1])
 
     assert {call.kwargs["camera_key"] for call in augment.call_args_list} == {
-        "observation.images.top", "observation.images.left_wrist"
+        "observation.images.top",
+        "observation.images.left_wrist",
     }
     assert item["observation.images.top"].shape == (3, 224, 224)
     assert item["observation.images.left_wrist"].shape == (3, 224, 224)

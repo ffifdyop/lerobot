@@ -36,6 +36,11 @@ import torch
 from torch import nn
 
 from lerobot.optim.ema import EMA
+from lerobot.utils.checkpoint_compat import (
+    canonical_pi05_key,
+    canonical_pi05_state_dict,
+    pi05_checkpoint_key_map,
+)
 from lerobot.utils.constants import EMA_SHARDED_STATE
 
 from .utils import is_main_process
@@ -184,6 +189,41 @@ def load_sharded_model(accelerator: "Accelerator", model: nn.Module, input_dir: 
     """
     from accelerate.utils import is_peft_model, load_fsdp_model
     from accelerate.utils.constants import FSDP_MODEL_NAME
+    from torch.distributed.checkpoint import FileSystemReader, load
+
+    directory = input_dir / f"{FSDP_MODEL_NAME}_0"
+    reader = FileSystemReader(str(directory))
+    metadata = reader.read_metadata()
+    names = {
+        path[1] for path in (metadata.planner_data or {}).values() if len(path) >= 2 and path[0] == "model"
+    }
+    aliases = pi05_checkpoint_key_map(names)
+    if any(name != saved for name, saved in aliases.items()):
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            get_model_state_dict,
+            set_model_state_dict,
+        )
+
+        if is_peft_model(model):
+            raise ValueError("Legacy PI05 joint checkpoints contain full weights, not PEFT adapters.")
+        accelerator.wait_for_everyone()
+        options = StateDictOptions(
+            full_state_dict=False,
+            cpu_offload=getattr(
+                getattr(_fsdp_plugin(accelerator), "state_dict_config", None), "offload_to_cpu", False
+            ),
+        )
+        target = get_model_state_dict(model, options=options)
+        if set(target) != set(aliases):
+            raise ValueError(
+                f"Legacy PI05 checkpoint model keys differ: missing={sorted(set(target) - set(aliases))}; "
+                f"unexpected={sorted(set(aliases) - set(target))}"
+            )
+        saved_state = {aliases[name]: value for name, value in target.items()}
+        load({"model": saved_state}, storage_reader=reader)
+        set_model_state_dict(model, canonical_pi05_state_dict(saved_state), options=options)
+        return
 
     load_fsdp_model(
         _fsdp_plugin(accelerator),
@@ -232,19 +272,51 @@ def load_sharded_optimizer(
         model (nn.Module): The prepared (sharded) model the optimizer state is keyed by.
         input_dir (Path): The directory containing the `optimizer_0/` shard subdirectory.
     """
-    from accelerate.utils import load_fsdp_optimizer
     from accelerate.utils.constants import OPTIMIZER_NAME
+    from torch.distributed.checkpoint import FileSystemReader, load
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        get_optimizer_state_dict,
+        set_optimizer_state_dict,
+    )
 
     # Unwrapped optimizer: torch's `_init_optim_state` runs a dummy step here (the state is
     # always empty on a fresh resume), which must not reach the fp16 scaler — see
     # `_inner_optimizer`.
-    load_fsdp_optimizer(
-        _fsdp_plugin(accelerator),
-        accelerator,
-        _inner_optimizer(optimizer),
-        model,
-        str(input_dir / f"{OPTIMIZER_NAME}_0"),
+    optimizer = _inner_optimizer(optimizer)
+    plugin = _fsdp_plugin(accelerator)
+    accelerator.wait_for_everyone()
+    reader = FileSystemReader(str(input_dir / f"{OPTIMIZER_NAME}_0"))
+    metadata = reader.read_metadata()
+    if metadata.planner_data is None:
+        raise ValueError("Optimizer DCP checkpoint lacks the nested state metadata required for loading.")
+    saved_parameters = {
+        path[2]
+        for path in metadata.planner_data.values()
+        if len(path) >= 3 and tuple(path[:2]) == ("optimizer", "state")
+    }
+    aliases = pi05_checkpoint_key_map(saved_parameters)
+    options = StateDictOptions(
+        full_state_dict=False,
+        cpu_offload=getattr(getattr(plugin, "state_dict_config", None), "offload_to_cpu", False),
+        # Only whole states absent from saved metadata are lazy/uninitialized.
+        # DCP loading remains strict for every field of each saved state.
+        strict=False,
     )
+    state_dict = get_optimizer_state_dict(model, optimizer, options=options)
+    expected_groups = [set(group["params"]) for group in state_dict["param_groups"]]
+    unexpected = set(aliases) - set(state_dict["state"])
+    if unexpected:
+        raise ValueError(f"Optimizer checkpoint contains unknown parameter states: {sorted(unexpected)}")
+    state_dict["state"] = {saved: state_dict["state"][name] for name, saved in aliases.items()}
+    load({"optimizer": state_dict}, storage_reader=reader)
+    state_dict["state"] = canonical_pi05_state_dict(state_dict["state"])
+    for group in state_dict["param_groups"]:
+        group["params"] = [canonical_pi05_key(name) for name in group["params"]]
+    actual_groups = [set(group["params"]) for group in state_dict["param_groups"]]
+    if actual_groups != expected_groups:
+        raise ValueError("Optimizer checkpoint parameter groups do not match the current optimizer.")
+    set_optimizer_state_dict(model, optimizer, state_dict, options=options)
 
 
 def save_sharded_ema(ema: EMA, output_dir: Path) -> None:

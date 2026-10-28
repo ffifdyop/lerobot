@@ -1,0 +1,32 @@
+{
+  "layout": "ddp",
+  "dp_shard": 1,
+  "world_size": 2,
+  "per_gpu_batch": 6,
+  "global_batch": 12,
+  "cameras": 3,
+  "image_size": 224,
+  "language_tokens": 200,
+  "action_horizon": 50,
+  "warmup_steps": 2,
+  "measured_steps": 3,
+  "precision": "bf16",
+  "gradient_checkpointing": true,
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "torch": "2.11.0+cu128",
+  "peak_allocated_gib_per_rank": [
+    82.21406555175781,
+    82.21561431884766
+  ],
+  "peak_reserved_gib_per_rank": [
+    83.26171875,
+    83.1796875
+  ],
+  "init_peak_allocated_gib_per_rank": [
+    30.936342239379883,
+    30.936342239379883
+  ],
+  "seconds_per_step": 1.3101013898849487,
+  "samples_per_second": 9.159596419521257,
+  "scope": "random full-size PI05, synthetic resident batches; excludes dataset I/O and checkpointing"
+}

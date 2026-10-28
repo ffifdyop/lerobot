@@ -28,6 +28,8 @@ from torchvision.transforms.v2 import (
     functional as F,  # noqa: N812
 )
 
+from .openpi import OpenPIImageAugmentation
+
 
 class JPEGCompression(Transform):
     """Simulate JPEG compression artifacts (block artifacts, color banding).
@@ -128,8 +130,6 @@ _PLANCKIAN_TEMPERATURE_STEP = 500
 # `transform` is a pure function of the frames and those parameters. That is what lets the
 # augmentation be reproduced from a seed, leave the default generators (and so the policy's own
 # noise) untouched, and run compiled or one chunk at a time without changing what is applied.
-
-from .openpi import OpenPIImageAugmentation
 
 ImageTransformsBackend = Literal["dataloader", "gpu"]
 
@@ -480,6 +480,7 @@ def apply_to_frames(
     The math runs on `float32` frames in `[0, 1]`. Some arguments are in the input's own pixel scale, as in
     torchvision: `fill` of the affine transforms, and anything a wrapped per-sample transform takes. So every
     parameter dict records whether the frames were `uint8`, and the transforms that need it read the flag.
+    Camera identity, when provided, is carried in the same per-call parameter tree.
 
     Args:
         transform (`BatchedTransform`):
@@ -492,6 +493,8 @@ def apply_to_frames(
             What applies the drawn parameters, e.g. a compiled `transform.transform`. Defaults to it.
         chunk_size (`int`, *optional*):
             Apply to at most this many samples at a time; the parameters are drawn for the whole batch first.
+        camera_key (`str`, *optional*):
+            Camera identity for transforms with camera-specific behavior, such as OpenPI.
 
     Returns:
         `torch.Tensor`: The transformed frames, in the input's dtype.
@@ -1356,8 +1359,9 @@ class PerSampleTransform(BatchedTransform):
     """Run a per-sample transform on each sample of a batch in turn.
 
     The adapter for transform types with no batched implementation: any `torchvision.transforms.v2` class
-    by name, and `JPEGCompression`. The wrapped transform draws its parameters from the default
-    generators, and the frames of one sample share them, as on the dataloader backend.
+    by name, `JPEGCompression`, and the camera-aware `OpenPIImageAugmentation`. Wrapped transforms draw
+    from the default generators. Native torchvision transforms share parameters across one sample's
+    frames; OpenPI retains its recipe's independent draws for each history frame.
 
     When the caller passes a generator (the gpu-backend training step), `make_params` draws one seed per
     sample from it, and `transform` seeds the default generators with that seed (under
@@ -1402,7 +1406,9 @@ class PerSampleTransform(BatchedTransform):
                 if isinstance(self.per_sample, OpenPIImageAugmentation):
                     camera_key = params.get("camera_key")
                     if camera_key is None:
-                        raise ValueError("OpenPIImageAugmentation requires camera_key for wrist-camera handling.")
+                        raise ValueError(
+                            "OpenPIImageAugmentation requires camera_key for wrist-camera handling."
+                        )
                     out = self.per_sample(sample, camera_key=camera_key)
                 else:
                     out = self.per_sample(sample)
@@ -1616,9 +1622,13 @@ class BatchedImageTransforms(nn.Module):
         n_subset = min(len(transforms), cfg.max_num_transforms)
         # OpenPI's recipe returns normalized float32, including for uint8 frames.
         # Native transforms retain the original input-dtype contract.
-        self._openpi_enabled = cfg.enable and n_subset > 0 and any(
-            isinstance(tf, PerSampleTransform) and isinstance(tf.per_sample, OpenPIImageAugmentation)
-            for tf in transforms.values()
+        self._openpi_enabled = (
+            cfg.enable
+            and n_subset > 0
+            and any(
+                isinstance(tf, PerSampleTransform) and isinstance(tf.per_sample, OpenPIImageAugmentation)
+                for tf in transforms.values()
+            )
         )
         self.tf: BatchedTransform
         if n_subset == 0 or not cfg.enable:
@@ -1648,10 +1658,13 @@ class BatchedImageTransforms(nn.Module):
             generator (`torch.Generator`, *optional*):
                 Generator on the images' device to draw the parameters from. The device's default generator
                 if `None`.
+            camera_key (`str`, *optional*):
+                Camera identity, required by OpenPI to distinguish wrist cameras.
 
         Returns:
             `torch.Tensor`: The transformed batch, same shape and dtype as the input. Floating point inputs
-            are computed in `float32`; `uint8` inputs are rounded back after the transform.
+            are computed in `float32`; `uint8` inputs are rounded back after the transform. An enabled
+            OpenPI recipe instead returns normalized `float32` and may resize the sample to 224x224.
         """
         if images.ndim not in (4, 5):
             raise ValueError(
@@ -1660,7 +1673,9 @@ class BatchedImageTransforms(nn.Module):
         if images.shape[-3] not in (1, 3):
             raise ValueError(f"Expected 1 or 3 channels, got shape {tuple(images.shape)}.")
         if self._openpi_enabled:
-            images = images.to(torch.float32) / 255.0 if images.dtype == torch.uint8 else images.to(torch.float32)
+            images = (
+                images.to(torch.float32) / 255.0 if images.dtype == torch.uint8 else images.to(torch.float32)
+            )
         frames = images.unsqueeze(1) if images.ndim == 4 else images
         out = apply_to_frames(
             self.tf, frames, generator, run=self._transform, chunk_size=self.chunk_size, camera_key=camera_key
@@ -1722,10 +1737,13 @@ class ImageTransforms(nn.Module):
             generator (`torch.Generator`, *optional*):
                 Generator on the images' device to draw the parameters from. The device's default generator
                 if `None`, which in a DataLoader worker is the worker's own.
+            camera_key (`str`, *optional*):
+                Camera identity, required by OpenPI to distinguish wrist cameras.
 
         Returns:
             `torch.Tensor`: The transformed images, same dtype as the input and, unless a configured transform
-            changes the frame size, the same shape.
+            changes the frame size, the same shape. An enabled OpenPI recipe returns normalized float32
+            and samples each history frame independently.
         """
         if images.ndim not in (3, 4):
             raise ValueError(f"Expected (C, H, W) or (T, C, H, W) images, got shape {tuple(images.shape)}.")
