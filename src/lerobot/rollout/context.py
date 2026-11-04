@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from collections.abc import Callable
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from threading import Event
 from typing import TYPE_CHECKING
@@ -46,6 +46,7 @@ from lerobot.inference import (
     supports_rtc_inference,
     validate_local_chunk_policy,
 )
+from lerobot.inference.rtc import accepts_noise_injection
 from lerobot.policies import (
     PreTrainedPolicy,
     get_policy_class,
@@ -55,6 +56,7 @@ from lerobot.policies import (
 from lerobot.policies.factory import has_peft_adapter_config
 from lerobot.processor import (
     PolicyProcessorPipeline,
+    RenameObservationsProcessorStep,
     RenderRuntimeMessagesStep,
     RobotAction,
     RobotObservation,
@@ -66,13 +68,17 @@ from lerobot.processor import (
 from lerobot.remote_inference import RemoteClient, RemoteInferenceEngine
 from lerobot.robots import Robot, make_robot_from_config
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
-from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
 from lerobot.utils.import_utils import _peft_available, require_package
 
 from .configs import RolloutConfig
 from .planner import PlannerConfig, VlmPlanner, training_vocabulary
 from .robot_wrapper import ThreadSafeRobot
+
+if TYPE_CHECKING:
+    from .saliency.manager import SaliencyManager
+    from .view_mask.runtime import ViewMaskRuntime
 
 if TYPE_CHECKING or _peft_available:
     from peft import PeftConfig, PeftModel
@@ -162,6 +168,21 @@ def _align_to_checkpoint_order(
     return reordered
 
 
+def _policy_action_keys(
+    dataset_features: dict, hardware_features: dict, checkpoint_order: list[str] | None
+) -> list[str]:
+    """Resolve dispatch labels after robot-side feature transformations."""
+    feature = dataset_features.get(ACTION, {})
+    keys = list(feature.get("names") or hardware_features)
+    if checkpoint_order and set(keys) == set(checkpoint_order):
+        keys = list(checkpoint_order)
+        feature["names"] = keys
+        state = dataset_features.get(OBS_STATE, {})
+        if set(state.get("names") or ()) == set(keys):
+            state["names"] = keys
+    return keys
+
+
 def _assert_state_matches_action_order(dataset_features: dict, ordered_action_keys: list[str]) -> None:
     """Reject a state layout that is a permutation of the action dispatch order.
 
@@ -231,6 +252,8 @@ class PolicyContext:
     preprocessor: PolicyProcessorPipeline | None
     postprocessor: PolicyProcessorPipeline | None
     inference: InferenceEngine
+    saliency: SaliencyManager | None = None
+    view_mask: ViewMaskRuntime | None = None
 
 
 @dataclass
@@ -269,6 +292,90 @@ class RolloutContext:
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
+
+
+def _find_rename_insert_index(preprocessor: PolicyProcessorPipeline) -> int:
+    """Index just past the last observation-rename step, i.e. where the mask step goes.
+
+    The mask must run *after* the rename (so it targets the canonical keys the policy
+    reads) and *before* every normalization and policy-specific image transform (so
+    the zeroed image is normalized exactly like any other frame).  When a pipeline has
+    no rename step at all the mask goes first, which is the same position for a
+    pipeline whose keys are already canonical.
+    """
+    last_rename = -1
+    for index, step in enumerate(preprocessor.steps):
+        if isinstance(step, RenameObservationsProcessorStep):
+            last_rename = index
+    return last_rename + 1
+
+
+def _view_mask_dataset_features(canonical_views: tuple[str, ...]) -> dict:
+    """The two per-frame mask fields, named by canonical view key."""
+    return {
+        "view_mask": {
+            "dtype": "bool",
+            "shape": (len(canonical_views),),
+            # Names (not just a shape) so a resumed run can prove the vector means
+            # the same thing — the same views, in the same slot order.
+            "names": list(canonical_views),
+        },
+        "view_mask_revision": {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": None,
+        },
+    }
+
+
+def _validate_view_mask_dataset(dataset: LeRobotDataset, canonical_views: tuple[str, ...]) -> None:
+    """Refuse to resume a dataset whose mask schema does not match this run.
+
+    Migration is deliberately not attempted: silently appending differently-shaped
+    or differently-named mask columns would produce a dataset whose frames cannot be
+    compared, which is worse than asking the operator to start a new recording.
+    """
+    features = dataset.meta.features if hasattr(dataset.meta, "features") else {}
+    problems: list[str] = []
+    for name, expected in _view_mask_dataset_features(canonical_views).items():
+        actual = features.get(name)
+        if actual is None:
+            problems.append(f"{name!r} is missing")
+            continue
+        if actual.get("dtype") != expected["dtype"]:
+            problems.append(f"{name!r} dtype is {actual.get('dtype')!r}, expected {expected['dtype']!r}")
+        elif tuple(actual.get("shape", ())) != tuple(expected["shape"]):
+            problems.append(f"{name!r} shape is {actual.get('shape')}, expected {expected['shape']}")
+        elif name == "view_mask" and list(actual.get("names") or []) != list(canonical_views):
+            problems.append(f"{name!r} names are {actual.get('names')}, expected {list(canonical_views)}")
+    if problems:
+        raise ValueError(
+            "Cannot --resume this dataset with view ablation enabled: "
+            + "; ".join(problems)
+            + ". Start a new dataset (drop --resume) — the mask schema cannot be migrated."
+        )
+
+
+def _inject_view_mask_step(preprocessor: PolicyProcessorPipeline) -> None:
+    """Splice the View Mask step into the checkpoint preprocessor, in memory only.
+
+    Deliberately not written back to the checkpoint's processor config: the step is a
+    rollout runtime concern, and persisting it would make every other consumer of the
+    checkpoint (eval, record) silently mask the same views.
+    """
+    from .view_mask.processor import ViewMaskProcessorStep
+
+    if any(isinstance(step, ViewMaskProcessorStep) for step in preprocessor.steps):
+        return
+    steps = list(preprocessor.steps)
+    insert_at = _find_rename_insert_index(preprocessor)
+    steps.insert(insert_at, ViewMaskProcessorStep())
+    preprocessor.steps = steps
+    logger.info(
+        "View ablation: mask processor injected at preprocessor step %d of %d",
+        insert_at,
+        len(steps),
+    )
 
 
 def _load_pretrained_policy(policy_config: PreTrainedConfig) -> PreTrainedPolicy:
@@ -521,8 +628,45 @@ def build_rollout_context(
     robot = robot_wrapper.inner
     dataset: LeRobotDataset | None = None
     hardware: HardwareContext | None = None
+    saliency_manager = None
+    view_mask_runtime = None
 
     try:
+        if cfg.saliency.enabled:
+            # Local import inside the saliency-only branch: pulls the manager (and transitively
+            # cv2 via the recorder) in only when saliency is enabled. The saliency package
+            # __init__ stays import-light by design, so importing through it costs nothing here.
+            from lerobot.rollout.saliency.manager import SaliencyManager, resolve_explainer_device
+
+            # Resolve the explainer device up front and make it explicit on cfg.saliency:
+            # from_pretrained loads onto config.device, so without the override the copy's
+            # weights would land on the policy's GPU first and only then move, transiently
+            # doubling policy-GPU residency. resolve_explainer_device gives an explicit
+            # cfg_device the win, so the manager re-resolves to the same device.
+            saliency_explainer_device = resolve_explainer_device(cfg.saliency.device, cfg.device or "cpu")
+            cfg.saliency.device = saliency_explainer_device
+
+            def _load_explainer_policy():
+                # torch.compile and the load device must stay off the explainer's copy:
+                # without the device override, from_pretrained would load onto the policy's
+                # GPU first (config object is shared), transiently doubling policy-GPU
+                # residency before .to(explainer_device) moves it.
+                explainer_config = deepcopy(policy_config)
+                if hasattr(explainer_config, "compile_model"):
+                    explainer_config.compile_model = False
+                if hasattr(explainer_config, "device"):
+                    explainer_config.device = saliency_explainer_device
+                return _load_pretrained_policy(explainer_config)
+
+            logger.info("Saliency enabled — loading explainer model copy on %s...", saliency_explainer_device)
+            saliency_manager = SaliencyManager(
+                cfg.saliency,
+                policy_config,
+                policy_device=cfg.device or "cpu",
+                display_mode=cfg.display_mode,
+                load_policy=_load_explainer_policy,
+            )
+
         # Retain position and base-velocity channels for mobile manipulators, plus cameras.
         all_obs_features = robot.observation_features
         observation_features_hw: dict[str, type | tuple] = {
@@ -545,8 +689,9 @@ def build_rollout_context(
             use_videos=cfg.dataset.video if cfg.dataset else True,
         )
         hw_features = hw_to_dataset_features(observation_features_hw, "observation")
-        # ``action_features_hw`` is already in checkpoint order, so it *is* the dispatch order.
-        ordered_action_keys = list(action_features_hw)
+        # Robot processors can expose a different action space (e.g. joint -> EE6D).
+        # Label policy outputs using that space, retaining checkpoint order when known.
+        ordered_action_keys = _policy_action_keys(dataset_features, action_features_hw, checkpoint_order)
         _assert_state_matches_action_order(dataset_features, ordered_action_keys)
 
         # Validate visual features if no rename_map is active
@@ -571,7 +716,30 @@ def build_rollout_context(
                     f"""--rename_map='{{"observation.images.top": "observation.images.cam0"}}'"""
                 )
 
+        # View ablation's dataset fields must exist before create() or be verified
+        # before resume(), so the plan is resolved here rather than after the engine.
+        view_mask_plan = None
+        if cfg.view_mask.enabled:
+            from .view_mask.config import build_view_mask_plan
+
+            view_mask_plan = build_view_mask_plan(
+                cfg.view_mask,
+                policy_view_keys=[
+                    key
+                    for key, feature in policy_config.input_features.items()
+                    if feature.type is FeatureType.VISUAL
+                ],
+                robot_camera_keys=[
+                    key for key, shape in all_obs_features.items() if isinstance(shape, tuple)
+                ],
+                rename_map=cfg.rename_map,
+            )
+
+        if view_mask_plan is not None:
+            dataset_features.update(_view_mask_dataset_features(view_mask_plan.canonical_views))
         dataset = _build_rollout_dataset(cfg, robot, dataset_features)
+        if cfg.resume and dataset is not None and view_mask_plan is not None:
+            _validate_view_mask_dataset(dataset, view_mask_plan.canonical_views)
 
         # Policy processors use recording statistics when available.
         dataset_stats = None
@@ -591,6 +759,26 @@ def build_rollout_context(
                 "rename_observations_processor": {"rename_map": cfg.rename_map},
             },
         )
+
+        # --- 6b. View ablation (needs policy features + robot cameras) -----
+        # Built after the pre/post processors exist so the mask step can be spliced
+        # into the checkpoint preprocessor, and before the engine so the engine can
+        # register itself as the transition-flush sink.
+        if view_mask_plan is not None:
+            from .view_mask.setup import build_view_mask_runtime, strategy_hotkey_claims
+
+            view_mask_runtime = build_view_mask_runtime(
+                cfg.view_mask,
+                policy_config,
+                robot_camera_keys=[
+                    key for key, shape in all_obs_features.items() if isinstance(shape, tuple)
+                ],
+                rename_map=cfg.rename_map,
+                dataset_root=str(dataset.root) if dataset is not None else None,
+                key_claims=strategy_hotkey_claims(cfg.strategy, cfg.teleop),
+                interactive=cfg.interactive,
+            )
+            _inject_view_mask_step(preprocessor)
 
         # Keep relative-action anchors fixed while the local policy's queued chunk drains.
         bind_relative_anchor(policy, preprocessor)
@@ -615,6 +803,24 @@ def build_rollout_context(
             compile_warmup_inferences=cfg.compile_warmup_inferences,
             shutdown_event=shutdown_event,
         )
+        if view_mask_runtime is not None:
+            inference_strategy.attach_view_mask(view_mask_runtime)
+
+        if saliency_manager is not None:
+            # Validation guarantees cfg.inference is RTC when saliency is enabled. Probe the
+            # noise kwarg too: supports_rtc_inference only binds inference_delay /
+            # prev_chunk_left_over, so an RTC-capable policy without a noise parameter must
+            # fail here at build time, not mid-loop inside the RTC thread.
+            if not accepts_noise_injection(policy):
+                raise ValueError(
+                    f"Saliency requires {policy_config.type}.predict_action_chunk to accept a "
+                    "'noise' parameter (the RTC engine injects the flow-matching noise so the "
+                    "explainer can replay the executed chunk exactly). Disable saliency "
+                    "(--saliency.enabled=false) or use a noise-injectable policy."
+                )
+            inference_strategy.saliency_sink = saliency_manager
+            logger.info("Saliency snapshots enabled: RTC engine will inject noise and submit chunk snapshots")
+
         _attach_planner(cfg, inference_strategy, robot_wrapper, preprocessor, policy_config)
 
         # Keep hardware closed while loading resources that may block robot control threads.
@@ -629,6 +835,8 @@ def build_rollout_context(
                 preprocessor=preprocessor,
                 postprocessor=postprocessor,
                 inference=inference_strategy,
+                saliency=saliency_manager,
+                view_mask=view_mask_runtime,
             ),
             processors=processors,
             data=DatasetContext(
@@ -639,6 +847,10 @@ def build_rollout_context(
             ),
         )
     except BaseException:
+        if saliency_manager is not None:
+            saliency_manager.stop()
+        if view_mask_runtime is not None:
+            view_mask_runtime.stop()
         if hardware is not None:
             _disconnect_setup_hardware(robot, hardware.teleop)
         if dataset is not None:

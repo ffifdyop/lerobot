@@ -476,9 +476,12 @@ class InferenceEngine(abc.ABC):
             self._pending_query = query
         return True
 
+    def _autosteer_queries_allowed(self) -> bool:
+        return True
+
     def _poll_autosteer(self, obs_processed: dict | None) -> None:
         """Queue the next-subtask query if the sequencer is due (control loop only)."""
-        if obs_processed is None:
+        if obs_processed is None or not self._autosteer_queries_allowed():
             return
         with self._query_lock:
             if self._autosteer_goal is None or self._autosteer_waiting_for_motion:

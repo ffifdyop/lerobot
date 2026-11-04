@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from ..inference import InferenceEngineConfig, RTCInferenceConfig
+from lerobot.inference import InferenceEngineConfig, RTCInferenceConfig
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,10 @@ def validate_saliency(
         raise ValueError(f"--saliency.alpha must be in (0, 1), got {saliency.alpha}")
     if saliency.norm_scope not in ("run", "chunk"):
         raise ValueError(f"--saliency.norm_scope must be 'run' or 'chunk', got {saliency.norm_scope!r}")
-    for name, values in (("attention_layers", saliency.attention_layers), ("attention_steps", saliency.attention_steps)):
+    for name, values in (
+        ("attention_layers", saliency.attention_layers),
+        ("attention_steps", saliency.attention_steps),
+    ):
         if values is not None:
             if not values:
                 raise ValueError(f"--saliency.{name} cannot be empty; use null for all values")
@@ -86,7 +89,9 @@ def validate_saliency(
                 raise ValueError(f"--saliency.{name} must contain unique non-negative integers")
             if len(set(values)) != len(values):
                 raise ValueError(f"--saliency.{name} must not contain duplicates")
-    if saliency.method != "attention" and (saliency.attention_layers is not None or saliency.attention_steps is not None):
+    if saliency.method != "attention" and (
+        saliency.attention_layers is not None or saliency.attention_steps is not None
+    ):
         raise ValueError("--saliency.attention_layers/attention_steps require --saliency.method=attention")
     if use_torch_compile:
         # Not fatal: compiled inductor graphs may reorder FP ops, so the eager replay is

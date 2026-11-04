@@ -17,14 +17,14 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import Any
 
 import torch
 
-from lerobot.lerobot_types import PolicyOutput, PolicyPrediction
+from lerobot.lerobot_types import PolicyPrediction
 from lerobot.policies import PreTrainedPolicy, reanchor_relative_rtc_prefix
 from lerobot.processor import (
     NormalizerProcessorStep,
@@ -36,16 +36,6 @@ from lerobot.processor import (
 )
 
 from .contracts import ChunkPolicySpec, ExecutionMode
-
-
-class _RTCPredictActionChunk(Protocol):
-    def __call__(
-        self,
-        batch: dict[str, Any],
-        *,
-        inference_delay: int,
-        prev_chunk_left_over: torch.Tensor | None,
-    ) -> torch.Tensor | PolicyOutput: ...
 
 
 @contextmanager
@@ -123,16 +113,19 @@ def predict_chunk(
     canonical_continuation: torch.Tensor | None = None,
     relative_step: RelativeActionsProcessorStep | None = None,
     normalizer_step: NormalizerProcessorStep | None = None,
+    noise: torch.Tensor | None = None,
+    on_prediction_inputs: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
 ) -> ChunkPrediction:
     """Predict and validate under exclusive policy/processor ownership.
 
     Retain the first model width across calls. Canonical postprocessing may crop
     padding; relative RTC requires matching widths. This function owns no scheduling.
+    Optional replay capture observes the exact post-reanchoring inputs immediately
+    before prediction; omitted noise preserves the policy's native call signature.
     """
     with chunk_inference_context(mode):
-        if mode is ExecutionMode.CHUNK:
-            predicted = policy.predict_action_chunk(prepared)
-        else:
+        kwargs: dict[str, Any] = {} if noise is None else {"noise": noise}
+        if mode is not ExecutionMode.CHUNK:
             prefix = _prepare_continuation(
                 model_continuation,
                 canonical_continuation,
@@ -150,8 +143,10 @@ def predict_chunk(
                 available = 0 if model_continuation is None else len(model_continuation)
                 if inference_delay > min(spec.training_max_delay, available, rtc_horizon):
                     raise ValueError("Trained RTC delay exceeds checkpoint or available continuation limits.")
-            predict = cast(_RTCPredictActionChunk, policy.predict_action_chunk)
-            predicted = predict(prepared, inference_delay=inference_delay, prev_chunk_left_over=prefix)
+            kwargs.update(inference_delay=inference_delay, prev_chunk_left_over=prefix)
+        if on_prediction_inputs is not None:
+            on_prediction_inputs(prepared, kwargs)
+        predicted = policy.predict_action_chunk(prepared, **kwargs)
         predicted_at = time.perf_counter()
         # A policy may return the chunk with a prediction; only the actions are validated and postprocessed.
         output = policy_output_to_transition(predicted)

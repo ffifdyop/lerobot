@@ -32,6 +32,8 @@ from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
 
 from .planner import PlannerConfig
+from .saliency.config import SaliencyConfig, validate_saliency
+from .view_mask.config import ViewMaskConfig, validate_view_mask
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +334,8 @@ class RolloutConfig:
     display_port: int | None = None
     # Whether to display compressed (JPEG) images instead of raw frames
     display_compressed_images: bool = False
+    saliency: SaliencyConfig = field(default_factory=SaliencyConfig)
+    view_mask: ViewMaskConfig = field(default_factory=ViewMaskConfig)
     # Use vocal synthesis to read events
     play_sounds: bool = True
     resume: bool = False
@@ -389,6 +393,20 @@ class RolloutConfig:
 
         if self.autosteer_interval_s < 0:
             raise ValueError(f"--autosteer_interval_s must be >= 0 (got {self.autosteer_interval_s}).")
+
+        validate_saliency(
+            self.saliency, self.inference, self.display_mode, self.display_data, self.use_torch_compile
+        )
+        validate_view_mask(self.view_mask)
+        if isinstance(self.inference, RemoteInferenceConfig) and (
+            self.saliency.enabled or self.view_mask.enabled
+        ):
+            raise ValueError("Saliency and view masks currently require local sync/RTC inference")
+
+        if self.view_mask.enabled and self.planner is not None:
+            raise ValueError(
+                "View masks with an external planner are unsupported: planner images bypass the local mask processor"
+            )
 
         # A strategy that writes frames from inside the timed control loop cannot afford
         # a blocking encode: force streaming encoding on its behalf.

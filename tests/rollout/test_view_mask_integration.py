@@ -31,6 +31,8 @@ import numpy as np
 import pytest
 import torch
 
+from lerobot.inference import InferenceEngine
+from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rollout import BaseStrategyConfig
 from lerobot.rollout.controller import LinkedEvent
 from lerobot.rollout.strategies import BaseStrategy
@@ -121,13 +123,13 @@ def _make_sync_engine(runtime):
     the rollout did not.  The pipeline is the genuine ``PolicyProcessorPipeline``,
     with an observing step after the mask.
     """
+    from lerobot.inference.sync import SyncInferenceEngine
     from lerobot.processor import (
         PolicyProcessorPipeline,
         policy_action_to_transition,
         transition_to_policy_action,
     )
     from lerobot.rollout.context import _inject_view_mask_step
-    from lerobot.rollout.inference.sync import SyncInferenceEngine
 
     probe = _ObservingStep()
     preprocessor = PolicyProcessorPipeline(steps=[])
@@ -221,11 +223,12 @@ def test_base_strategy_runs_a_fresh_action_through_mask_transition():
     shutdown = Event()
     states_at_inference: list[MaskApplicationState] = []
 
-    class _LoopEngine:
+    class _LoopEngine(InferenceEngine):
+        control_thread_owns_policy = True
+
         def __init__(self):
+            super().__init__()
             self.view_mask = runtime
-            self.failed = False
-            self.failure_traceback = None
             self.resets = 0
             self.started = False
             self.resumed = False
@@ -275,6 +278,9 @@ def test_base_strategy_runs_a_fresh_action_through_mask_transition():
                 display_mode="rerun",
                 display_compressed_images=False,
                 cadence_report=None,
+                interactive=False,
+                status_interval_s=0,
+                device="cpu",
             ),
             shutdown_event=shutdown,
             cadence_report=None,
@@ -287,7 +293,9 @@ def test_base_strategy_runs_a_fresh_action_through_mask_transition():
         ),
         policy=SimpleNamespace(inference=engine, view_mask=runtime),
         data=SimpleNamespace(
-            dataset_features={"observation.state": {"dtype": "float32", "shape": (1,), "names": ["joint.pos"]}},
+            dataset_features={
+                "observation.state": {"dtype": "float32", "shape": (1,), "names": ["joint.pos"]}
+            },
             ordered_action_keys=["joint.pos"],
         ),
     )
@@ -422,6 +430,7 @@ def test_vqa_and_autosteer_are_refused_while_the_mask_is_blocked():
     runtime = _runtime(_plan())
     engine = MagicMock()
     engine.supports_text_queries = True
+    engine.text_input_error.return_value = None
     engine.task = "fold"
     engine.failed = False
     engine.failure_traceback = None
@@ -517,7 +526,6 @@ class _FrameFieldStrategy(BaseStrategy):
 
 def _fields_from_strategy(runtime, *, human: bool):
     """Exercise the strategy-level frame-field helper without a full loop."""
-    from lerobot.rollout import BaseStrategyConfig
 
     strategy = _FrameFieldStrategy(BaseStrategyConfig())
     strategy._view_mask = runtime
@@ -731,6 +739,8 @@ class _RecordingSinkRecorder:
         self.recorder = SaliencyRecorder.__new__(SaliencyRecorder)
         self.recorder._view_mask = None
         self.recorder._stale_dropped = 0
+        self.recorder._submitted = 0
+        self.recorder._queue_dropped = 0
         self.recorder._closed = False
         import queue
 
@@ -852,7 +862,16 @@ class _GatedViewPolicy:
         self.seen_text_views: list[dict] = []
         self.reset_count = 0
         self.seen_reset_counts: list[int] = []
-        self.config = SimpleNamespace(chunk_size=chunk_len, max_action_dim=action_dim)
+        self.config = SimpleNamespace(
+            chunk_size=chunk_len, max_action_dim=action_dim, n_obs_steps=1, n_action_steps=chunk_len
+        )
+
+    chunk_inference_spec = PreTrainedPolicy.chunk_inference_spec
+    _action_queue_attrs = PreTrainedPolicy._action_queue_attrs
+    drop_queued_actions = PreTrainedPolicy.drop_queued_actions
+
+    def supports_rtc(self):
+        return True
 
     def allow_one_inference(self) -> None:
         self._release.release()
@@ -882,6 +901,7 @@ class _GatedViewPolicy:
 
 
 def _make_view_rtc_engine(runtime, *, chunk_len=6, queue_threshold=30):
+    from lerobot.inference import RTCInferenceEngine
     from lerobot.policies.rtc.configuration_rtc import RTCConfig
     from lerobot.processor import (
         PolicyProcessorPipeline,
@@ -889,7 +909,6 @@ def _make_view_rtc_engine(runtime, *, chunk_len=6, queue_threshold=30):
         transition_to_policy_action,
     )
     from lerobot.rollout.context import _inject_view_mask_step
-    from lerobot.rollout.inference import RTCInferenceEngine
 
     probe = _ObservingStep()
     preprocessor = PolicyProcessorPipeline(steps=[])
@@ -906,11 +925,8 @@ def _make_view_rtc_engine(runtime, *, chunk_len=6, queue_threshold=30):
             to_transition=policy_action_to_transition,
             to_output=transition_to_policy_action,
         ),
-        robot_wrapper=SimpleNamespace(robot_type="mock", action_features={}),
+        robot_wrapper=SimpleNamespace(robot_type="mock", action_features={}, supports_hold=True),
         rtc_config=RTCConfig(enabled=True, execution_horizon=4, max_guidance_weight=1.0),
-        hw_features={
-            "observation.state": {"dtype": "float32", "shape": (2,), "names": ["j1.pos", "j2.pos"]},
-        },
         dataset_features={
             "observation.state": {"dtype": "float32", "shape": (2,), "names": ["j1.pos", "j2.pos"]},
             "observation.images.top": {"dtype": "image", "shape": (4, 4, 3), "names": None},
@@ -1063,6 +1079,7 @@ def test_rtc_resets_policy_before_the_first_post_transition_inference():
         policy.allow_one_inference()  # complete the pre-transition chunk
         assert _wait_until(lambda: policy.reset_count >= 1)
 
+        engine.notify_observation(dict(_RTC_VIEW_OBS))
         policy.allow_one_inference()  # the first chunk after the worker's deferred reset
         assert _wait_until(lambda: len(policy.seen_reset_counts) >= 2)
         assert policy.seen_reset_counts[-1] >= 1
@@ -1076,7 +1093,7 @@ def test_rtc_vqa_uses_the_same_masked_batch_as_the_actions():
     # black view the actions were based on.
     runtime = _runtime(_plan(initial_views=["observation.images.left_wrist"]))
     engine, policy = _make_view_rtc_engine(runtime)
-    from lerobot.rollout.inference.base import PolicyQuery, QueryKind
+    from lerobot.inference.base import PolicyQuery, QueryKind
 
     answer = engine._generate_text(
         dict(_RTC_VIEW_OBS),
@@ -1116,6 +1133,9 @@ def test_rtc_discards_text_result_when_mask_changes_during_generation(query_kind
     try:
         engine.resume()
         engine.notify_observation(dict(_RTC_VIEW_OBS))
+        assert not engine.dispatch_allowed()
+        engine.acknowledge_hold()
+        engine.notify_observation(dict(_RTC_VIEW_OBS))
         assert _wait_until(text_started.is_set)
 
         runtime.controller.toggle("observation.images.top")
@@ -1124,7 +1144,8 @@ def test_rtc_discards_text_result_when_mask_changes_during_generation(query_kind
 
         assert _wait_until(lambda: not engine._query_in_flight)
         engine.pump_query(dict(_RTC_VIEW_OBS))
-        assert answers == []
+        assert not any(answer.answer for answer in answers)
+        assert all(answer.error for answer in answers)  # upstream reports cancellation once
         if query_kind == "autosteer":
             assert engine.task == "fold"
             assert not engine.has_pending_query

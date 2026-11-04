@@ -37,6 +37,7 @@ class BaseStrategy(RolloutStrategy):
     def setup(self, ctx: RolloutContext) -> None:
         """Initialise the inference engine."""
         self._init_engine(ctx)
+        self._attach_view_mask(ctx)
         logger.info("Base strategy ready")
 
     def run(self, ctx: RolloutContext) -> None:
@@ -73,9 +74,13 @@ class BaseStrategy(RolloutStrategy):
                 if self._handle_warmup(cfg.use_torch_compile, timer):
                     continue
 
+                self._view_mask_tick(ctx, runnable=True)
+                if self._view_mask_failed_should_stop(ctx):
+                    break
                 step = send_next_action(obs_processed, obs, ctx, interpolator, timer)
                 with timer.section("telemetry"):
                     self._log_telemetry(obs_processed, step, ctx.runtime)
+                    self._log_view_mask(ctx.runtime)
 
                 # Service the text-query channel (/vqa answers, /autosteer turns) at
                 # the end of the tick; no-op when nothing is queued.

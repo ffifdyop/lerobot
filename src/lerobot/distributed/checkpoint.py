@@ -193,7 +193,14 @@ def load_sharded_model(accelerator: "Accelerator", model: nn.Module, input_dir: 
 
     directory = input_dir / f"{FSDP_MODEL_NAME}_0"
     reader = FileSystemReader(str(directory))
-    metadata = reader.read_metadata()
+    try:
+        metadata = reader.read_metadata()
+    except FileNotFoundError:
+        # Preserve Accelerate/DCP's collective missing-artifact error contract.
+        load_fsdp_model(
+            _fsdp_plugin(accelerator), accelerator, model, str(directory), adapter_only=is_peft_model(model)
+        )
+        return
     names = {
         path[1] for path in (metadata.planner_data or {}).values() if len(path) >= 2 and path[0] == "model"
     }
@@ -272,6 +279,7 @@ def load_sharded_optimizer(
         model (nn.Module): The prepared (sharded) model the optimizer state is keyed by.
         input_dir (Path): The directory containing the `optimizer_0/` shard subdirectory.
     """
+    from accelerate.utils import load_fsdp_optimizer
     from accelerate.utils.constants import OPTIMIZER_NAME
     from torch.distributed.checkpoint import FileSystemReader, load
     from torch.distributed.checkpoint.state_dict import (
@@ -287,7 +295,11 @@ def load_sharded_optimizer(
     plugin = _fsdp_plugin(accelerator)
     accelerator.wait_for_everyone()
     reader = FileSystemReader(str(input_dir / f"{OPTIMIZER_NAME}_0"))
-    metadata = reader.read_metadata()
+    try:
+        metadata = reader.read_metadata()
+    except FileNotFoundError:
+        load_fsdp_optimizer(plugin, accelerator, optimizer, model, str(input_dir / f"{OPTIMIZER_NAME}_0"))
+        return
     if metadata.planner_data is None:
         raise ValueError("Optimizer DCP checkpoint lacks the nested state metadata required for loading.")
     saved_parameters = {

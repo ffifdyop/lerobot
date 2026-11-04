@@ -29,6 +29,7 @@ import torch
 
 from lerobot.lerobot_types import EnvTransition
 from lerobot.policies import ActionQueue, PreTrainedPolicy, RTCConfig, prepare_observation_for_inference
+from lerobot.policies.common.flow_matching import sample_noise
 from lerobot.processor import (
     NormalizerProcessorStep,
     PolicyProcessorPipeline,
@@ -49,6 +50,7 @@ from .contracts import (
 )
 from .execution import ChunkRuntime, HoldState
 from .prediction import chunk_inference_context, predict_chunk
+from .view_mask import ViewMaskInferenceMixin, stamp_view_mask
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +107,69 @@ def supports_rtc_inference(policy: PreTrainedPolicy) -> bool:
 # ---------------------------------------------------------------------------
 
 
-class RTCInferenceEngine(InferenceEngine):
+def accepts_noise_injection(policy: PreTrainedPolicy) -> bool:
+    """Whether ``predict_action_chunk`` also accepts the ``noise`` kwarg saliency replay injects.
+
+    Probed separately from :func:`supports_rtc_inference` because saliency is opt-in: a policy
+    can be RTC-capable without a noise parameter, and attaching a saliency sink to such a
+    policy must fail at build time instead of deep inside the RTC loop.
+    """
+    try:
+        inspect.signature(policy.predict_action_chunk).bind(
+            object(),
+            inference_delay=0,
+            prev_chunk_left_over=None,
+            noise=None,
+        )
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _build_saliency_snapshot(
+    preprocessed: dict,
+    noise: torch.Tensor | None,
+    inference_delay: int,
+    prev_chunk_left_over: torch.Tensor | None,
+    view_mask=None,
+    *,
+    reset_epoch: int | None = None,
+    chunk_id: int | None = None,
+    observation_time: float | None = None,
+) -> dict:
+    """Copy of everything the saliency explainer needs to replay one chunk exactly.
+
+    Captured *after* the View Mask processor, so the explainer replays the black
+    images the policy actually consumed; ``view_mask`` lets the recorder drop a
+    snapshot whose revision has since been superseded.
+
+    The mask entry is added only when a mask is in play, so an ablation-free rollout
+    produces exactly the snapshot it did before the capability existed.
+    """
+    snapshot = {
+        "preprocessed": {
+            k: (v.detach().clone() if isinstance(v, torch.Tensor) else v) for k, v in preprocessed.items()
+        },
+        "noise": None if noise is None else noise.detach().clone(),
+        "chunk_kwargs": {
+            "inference_delay": inference_delay,
+            "prev_chunk_left_over": None
+            if prev_chunk_left_over is None
+            else prev_chunk_left_over.detach().clone(),
+        },
+    }
+    if reset_epoch is not None:
+        snapshot["reset_epoch"] = reset_epoch
+    if chunk_id is not None:
+        snapshot["chunk_id"] = chunk_id
+    if observation_time is not None:
+        snapshot["observation_time"] = observation_time
+    if view_mask is not None:
+        snapshot["view_mask"] = view_mask
+    return snapshot
+
+
+class RTCInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
     """Background RTC prediction with control-thread capture and action consumption.
 
     Notify each capture; pause/resume around intervention and honor dispatch gates.
@@ -203,6 +267,8 @@ class RTCInferenceEngine(InferenceEngine):
         self._global_shutdown_event = shutdown_event
         self._rtc_thread: Thread | None = None
         self._started = False
+        self.saliency_sink = None
+        self._saliency_chunk_id = 0
 
         if not self._use_torch_compile:
             self._compile_warmup_done.set()
@@ -298,6 +364,7 @@ class RTCInferenceEngine(InferenceEngine):
         self._runtime.deactivate()
         with self._obs_lock:
             self._reset_epoch += 1
+            self._invalidate_saliency()
             self._obs_holder["obs"] = None
             self._hold.clear()
 
@@ -354,6 +421,7 @@ class RTCInferenceEngine(InferenceEngine):
             self._runtime.invalidate()
             self._obs_holder["obs"] = None
             self._reset_epoch += 1
+            self._invalidate_saliency()
             self._reset_pending = True
             self._hold.clear()
         # The queue is empty, so a pending task change has nothing stale to blend against.
@@ -362,6 +430,14 @@ class RTCInferenceEngine(InferenceEngine):
     # ------------------------------------------------------------------
     # Action production (called from main thread)
     # ------------------------------------------------------------------
+
+    def _invalidate_saliency(self) -> None:
+        if self.saliency_sink is not None and hasattr(self.saliency_sink, "set_reset_epoch"):
+            self.saliency_sink.set_reset_epoch(self._reset_epoch)
+
+    def reset_for_mask_transition(self) -> None:
+        """Revoke the old generation and defer policy reset to its owner thread."""
+        self.reset()
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | EnvTransition | None:
         """Pop the next action from the RTC queue (ignores ``obs_frame``).
@@ -374,6 +450,15 @@ class RTCInferenceEngine(InferenceEngine):
         if queued is None:
             return None
         action, provenance = queued
+        if self._view_mask is not None:
+            revision = provenance.view_mask_revision
+            if revision is None:
+                raise RuntimeError("RTC action queue returned an action without view-mask provenance")
+            if not self._view_mask.is_executable(revision):
+                return None
+            snapshot = self._view_mask.snapshot()
+            self._view_mask.set_dispatched(snapshot)
+            self._view_mask.mark_active(snapshot)
         self._set_dispatched_task(provenance.task)
         if (prediction := self._runtime.take_prediction()) is None:
             return action
@@ -388,6 +473,7 @@ class RTCInferenceEngine(InferenceEngine):
         with self._obs_lock:
             self._obs_holder["obs"] = owned
             self._obs_holder["capture_time"] = captured_at
+            self._obs_holder["mask"] = self._view_mask.snapshot() if self._view_mask is not None else None
 
     def dispatch_allowed(self) -> bool:
         """Revoke dispatch on every motor tick, including interpolation-only ticks."""
@@ -472,6 +558,10 @@ class RTCInferenceEngine(InferenceEngine):
         obs_batch = prepare_observation_for_inference(
             obs_batch, torch.device(self._device), task, self._robot.robot_type
         )
+        mask = self._view_mask.snapshot() if self._view_mask is not None else None
+        self._active_query_mask = mask
+        if mask is not None:
+            stamp_view_mask(obs_batch, mask)
         obs_batch = self._mark_query(obs_batch, query)
         generation = self._active_query_generation
         if generation != self._runtime.generation:
@@ -488,7 +578,8 @@ class RTCInferenceEngine(InferenceEngine):
 
     def _query_context_valid(self, query: PolicyQuery) -> bool:
         return (
-            not self.failed
+            super()._query_context_valid(query)
+            and not self.failed
             and self._policy_active.is_set()
             and self._active_query_generation == self._runtime.generation
             and query.task_version == self.task_version
@@ -574,6 +665,7 @@ class RTCInferenceEngine(InferenceEngine):
                     obs = self._obs_holder.get("obs")
                     capture_time = self._obs_holder.get("capture_time")
                     epoch_before = self._reset_epoch
+                    mask = self._obs_holder.get("mask")
                 if obs is None or capture_time is None:
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
@@ -604,6 +696,50 @@ class RTCInferenceEngine(InferenceEngine):
                     self._robot.robot_type,
                 )
                 batch["task"] = [task]
+                if mask is not None:
+                    stamp_view_mask(batch, mask)
+                pending_saliency = None
+                noise = None
+                if self.saliency_sink is not None:
+                    try:
+                        noise = sample_noise(
+                            (1, int(self._policy.config.chunk_size), int(self._policy.config.max_action_dim)),
+                            policy_device,
+                        )
+                    except Exception:
+                        logger.warning("Disabling saliency after noise setup failed", exc_info=True)
+                        self.saliency_sink = None
+
+                def capture_replay(
+                    prepared,
+                    kwargs,
+                    mask=mask,
+                    epoch_before=epoch_before,
+                    capture_time=capture_time,
+                    mode=request.mode,
+                ):
+                    nonlocal pending_saliency
+                    if self.saliency_sink is None or not self._compile_warmup_done.is_set():
+                        return
+                    try:
+                        pending_saliency = _build_saliency_snapshot(
+                            prepared,
+                            kwargs.get("noise"),
+                            kwargs.get("inference_delay", 0),
+                            kwargs.get("prev_chunk_left_over"),
+                            mask,
+                            reset_epoch=epoch_before,
+                            chunk_id=self._saliency_chunk_id,
+                            observation_time=capture_time,
+                        )
+                        # CHUNK calls omit RTC conditioning entirely, including during replay.
+                        if mode is ExecutionMode.CHUNK:
+                            pending_saliency["chunk_kwargs"] = {}
+                        self._saliency_chunk_id += 1
+                    except Exception:
+                        logger.warning("Disabling saliency after snapshot capture failed", exc_info=True)
+                        self.saliency_sink = None
+
                 with chunk_inference_context(request.mode):
                     preprocessed = self._preprocessor(batch)
                     prediction = predict_chunk(
@@ -621,6 +757,8 @@ class RTCInferenceEngine(InferenceEngine):
                         canonical_continuation=canonical_previous,
                         relative_step=self._relative_step,
                         normalizer_step=self._normalizer_step,
+                        noise=noise,
+                        on_prediction_inputs=capture_replay if self.saliency_sink is not None else None,
                     )
                     original, processed = prediction.model_actions, prediction.canonical_actions
                     self._model_action_dim = original.shape[1]
@@ -646,11 +784,31 @@ class RTCInferenceEngine(InferenceEngine):
                     model_actions=original,
                     canonical_actions=processed,
                     execution_steps=len(processed),
-                    provenance=ActionProvenance(capture_time, task, task_version),
+                    provenance=ActionProvenance(
+                        capture_time,
+                        task,
+                        task_version,
+                        view_mask_revision=None if mask is None else mask.revision,
+                    ),
                     prediction=prediction.prediction,
                 )
-                with self._task_lock:
-                    accepted = self._runtime.accept(request, chunk, task_version=self._task_version)
+                with self._task_lock, self._obs_lock:
+                    current = epoch_before == self._reset_epoch and (
+                        mask is None or self._view_mask.is_executable(mask.revision)
+                    )
+                    accepted = current and self._runtime.accept(
+                        request, chunk, task_version=self._task_version
+                    )
+                    if accepted and pending_saliency is not None and self.saliency_sink is not None:
+                        pending_saliency["first_queued_action_index"] = self._runtime.last_accept[
+                            "trimmed_actions"
+                        ]
+                        pending_saliency["accepted_epoch"] = self._reset_epoch
+                        try:
+                            self.saliency_sink.submit(pending_saliency)
+                        except Exception:
+                            logger.warning("Disabling saliency after submission failed", exc_info=True)
+                            self.saliency_sink = None
                 if accepted:
                     consecutive_discards = 0
                 elif request.generation != self._runtime.generation:
@@ -669,5 +827,7 @@ class RTCInferenceEngine(InferenceEngine):
             self._failure_traceback = traceback.format_exc()
             logger.exception("Fatal error in RTC thread: %s", exc)
             self._runtime.fault(str(exc))
+            if self._view_mask is not None:
+                self._view_mask.mark_failed(str(exc))
             self._rtc_error.set()
             self._compile_warmup_done.set()

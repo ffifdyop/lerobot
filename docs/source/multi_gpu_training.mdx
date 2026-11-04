@@ -136,10 +136,14 @@ torchrun --nproc-per-node=4 $(which lerobot-train) \
 ## Stopping training
 
 Press **Ctrl+C once** in the foreground `torchrun` terminal. Training ranks record
-SIGINT/SIGTERM as a stop request, finish the current batch, and agree at a shared
-boundary before exiting. The same mechanism works when only one training rank
-receives the signal. DataLoader children ignore SIGINT so they can continue serving
-the batch while their trainer coordinates shutdown.
+SIGINT as a stop request, finish the current batch, and agree at a shared boundary
+before exiting. Direct SIGTERM to a training rank also uses this mechanism.
+DataLoader children ignore SIGINT so they can continue serving the batch while
+their trainer coordinates shutdown.
+
+SIGTERM sent to the launcher or an entire process group also terminates its
+DataLoader workers. If a trainer is waiting for a batch, that can become a worker
+failure and follow exception cleanup instead of coordinated exit status 143.
 
 Process-group cleanup runs on normal completion, coordinated interrupts, and
 exceptions. Cleanup adds no barrier, since another rank may already have failed.

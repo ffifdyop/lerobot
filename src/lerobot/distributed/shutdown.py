@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 def init_training_data_worker(worker_id: int) -> None:
     """Let the trainer handle Ctrl+C while keeping worker termination available.
 
-    torchrun forwards terminal signals to each worker process group, which also
+    torchrun forwards terminal SIGINT to each worker process group, which also
     contains its DataLoader children. They must keep serving the current batch
     until the trainer reaches its coordinated stop boundary. SIGTERM retains its
     default meaning for DataLoader's forced worker cleanup (including after fork).

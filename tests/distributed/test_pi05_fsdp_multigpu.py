@@ -276,7 +276,9 @@ def legacy_worker(rank, world_size, port, precision, directory):
                 del reference_optimizer.optimizer.state[p]
         # The full-state helper also flattens tuples (e.g. Adam betas) to lists.
         # Keep the independent reference's saved optimizer settings verbatim.
-        for current_group, saved_group in zip(reference_optimizer.param_groups, optimizer_state["param_groups"], strict=True):
+        for current_group, saved_group in zip(
+            reference_optimizer.param_groups, optimizer_state["param_groups"], strict=True
+        ):
             current_group.update({key: value for key, value in saved_group.items() if key != "params"})
         print(f"legacy rank {rank}: reference state set", flush=True)
         fresh_model, fresh_state = _gather_full(fresh, fresh_optimizer)

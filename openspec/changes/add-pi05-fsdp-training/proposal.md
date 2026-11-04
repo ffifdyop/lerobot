@@ -1,3 +1,7 @@
+> 历史方案说明：本变更记录旧版本的联合层实现与当时验证。当前实现已由
+> `migrate-upstream-rebase` 替代，采用上游 PI05 结构和显式 `SiglipEncoderLayer`
+> 分片，并保留 checkpoint 兼容与退出清理。历史验证数值不代表当前版本。
+
 ## Why
 
 当前训练框架具备 FSDP2，但 PI05 的联合 attention 直接访问 VLM 与 action expert 的层内部模块，缺少可靠的分片边界。需要让双卡全参训练能够分片参数、梯度和优化器状态，同时继续使用现有预训练权重和单卡 rollout。

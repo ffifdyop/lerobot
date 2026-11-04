@@ -280,6 +280,8 @@ class DAggerStrategy(RolloutStrategy):
                 "Consider enabling it for faster episode saving: "
                 "--dataset.streaming_encoding=true --dataset.encoder_threads=2"
             )
+        self._attach_view_mask(ctx)
+        self._view_mask_dataset = ctx.data.dataset if self._view_mask is not None else None
         self._push_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dagger-push")
         target_mb = self.config.target_video_file_size_mb or DEFAULT_VIDEO_FILE_SIZE_IN_MB
         self._episode_duration_s = estimate_max_episode_seconds(
@@ -415,6 +417,15 @@ class DAggerStrategy(RolloutStrategy):
                             # one could shift under the other.
                             correction_tick = 0
 
+                    # View ablation runs every tick, in every phase: the mask must be
+                    # settable before the operator has started, and a transition must
+                    # never be charged against a phase where inference was paused.
+                    in_policy_phase = events.phase == DAggerPhase.AUTONOMOUS
+                    self._view_mask_tick(ctx, runnable=in_policy_phase, phase=events.phase.value)
+                    if in_policy_phase and self._view_mask_failed_should_stop(ctx):
+                        logger.error("View mask failed; ending DAgger segment")
+                        break
+
                     phase = events.phase
                     with timer.section("observe"):
                         obs = robot.get_observation()
@@ -439,17 +450,30 @@ class DAggerStrategy(RolloutStrategy):
                             self._log_telemetry(
                                 obs_processed, robot_action_to_transition(processed_teleop), ctx.runtime
                             )
+                            self._log_view_mask(ctx.runtime)
                         if correction_tick % correction_stride == 0:
-                            with timer.section("record"):
-                                obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
-                                action_frame = build_dataset_frame(features, processed_teleop, prefix=ACTION)
-                                frame = {
-                                    **obs_frame,
-                                    **action_frame,
-                                    "task": task_str,
-                                    "intervention": np.array([True], dtype=bool),
-                                }
-                                dataset.add_frame(frame)
+                            # A Human frame has no dispatched action, so it carries the
+                            # live mask: the Shadow Policy's condition at this instant.
+                            # Human control keeps recording during APPLYING — the mask
+                            # only governs what the *policy* sees, and a FAILED mask
+                            # must not take the robot away from the operator.
+                            mask_fields = self._human_view_mask_fields()
+                            if mask_fields is not None or self._view_mask is None:
+                                with timer.section("record"):
+                                    obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
+                                    action_frame = build_dataset_frame(
+                                        features, processed_teleop, prefix=ACTION
+                                    )
+                                    frame = {
+                                        **obs_frame,
+                                        **action_frame,
+                                        "task": task_str,
+                                        "intervention": np.array([True], dtype=bool),
+                                    }
+                                    if mask_fields is not None:
+                                        frame.update(mask_fields)
+                                    dataset.add_frame(frame)
+                                    self._note_recorded_frame(dataset)
                         correction_tick += 1
 
                     # --- PAUSED: hold position ---
@@ -470,10 +494,12 @@ class DAggerStrategy(RolloutStrategy):
                             continue
 
                         step = send_next_action(obs_processed, obs, ctx, interpolator, timer)
-                        if step is not None:
+                        mask_fields = self._view_mask_frame_fields(human=False)
+                        if step is not None and (mask_fields is not None or self._view_mask is None):
                             action_dict = transition_to_robot_action(step)
                             with timer.section("telemetry"):
                                 self._log_telemetry(obs_processed, step, ctx.runtime)
+                                self._log_view_mask(ctx.runtime)
                             last_action = ctx.processors.robot_action_processor((action_dict, obs))
                             if interpolator.emitted_policy_action:
                                 with timer.section("record"):
@@ -485,7 +511,10 @@ class DAggerStrategy(RolloutStrategy):
                                         "task": engine.dispatched_task,
                                         "intervention": np.array([False], dtype=bool),
                                     }
+                                    if mask_fields is not None:
+                                        frame.update(mask_fields)
                                     dataset.add_frame(frame)
+                                    self._note_recorded_frame(dataset)
 
                         engine.pump_query(obs_processed)
 
@@ -632,6 +661,12 @@ class DAggerStrategy(RolloutStrategy):
                         logger.info("Upload requested by user")
                         self._background_push(dataset, cfg)
 
+                    in_policy_phase = events.phase == DAggerPhase.AUTONOMOUS
+                    self._view_mask_tick(ctx, runnable=in_policy_phase, phase=events.phase.value)
+                    if in_policy_phase and self._view_mask_failed_should_stop(ctx):
+                        logger.error("View mask failed; ending DAgger segment")
+                        break
+
                     phase = events.phase
                     with timer.section("observe"):
                         obs = robot.get_observation()
@@ -656,19 +691,26 @@ class DAggerStrategy(RolloutStrategy):
                             self._log_telemetry(
                                 obs_processed, robot_action_to_transition(processed_teleop), ctx.runtime
                             )
+                            self._log_view_mask(ctx.runtime)
 
                         if correction_tick % correction_stride == 0:
-                            with timer.section("record"):
-                                obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
-                                action_frame = build_dataset_frame(features, processed_teleop, prefix=ACTION)
-                                dataset.add_frame(
-                                    {
+                            mask_fields = self._human_view_mask_fields()
+                            if mask_fields is not None or self._view_mask is None:
+                                with timer.section("record"):
+                                    obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
+                                    action_frame = build_dataset_frame(
+                                        features, processed_teleop, prefix=ACTION
+                                    )
+                                    frame = {
                                         **obs_frame,
                                         **action_frame,
                                         "task": task_str,
                                         "intervention": np.array([True], dtype=bool),
                                     }
-                                )
+                                    if mask_fields is not None:
+                                        frame.update(mask_fields)
+                                    dataset.add_frame(frame)
+                                    self._note_recorded_frame(dataset)
                         correction_tick += 1
 
                     # --- PAUSED: hold position ---
@@ -689,10 +731,12 @@ class DAggerStrategy(RolloutStrategy):
                             continue
 
                         step = send_next_action(obs_processed, obs, ctx, interpolator, timer)
-                        if step is not None:
+                        mask_fields = self._view_mask_frame_fields(human=False)
+                        if step is not None and (mask_fields is not None or self._view_mask is None):
                             action_dict = transition_to_robot_action(step)
                             with timer.section("telemetry"):
                                 self._log_telemetry(obs_processed, step, ctx.runtime)
+                                self._log_view_mask(ctx.runtime)
                             last_action = ctx.processors.robot_action_processor((action_dict, obs))
 
                         engine.pump_query(obs_processed)

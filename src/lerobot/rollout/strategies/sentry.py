@@ -85,6 +85,8 @@ class SentryStrategy(RolloutStrategy):
     def setup(self, ctx: RolloutContext) -> None:
         """Initialise the inference engine and background push executor."""
         self._init_engine(ctx)
+        self._attach_view_mask(ctx)
+        self._view_mask_dataset = ctx.data.dataset if self._view_mask is not None else None
         self._push_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sentry-push")
         target_mb = self.config.target_video_file_size_mb or DEFAULT_VIDEO_FILE_SIZE_IN_MB
         self._episode_duration_s = estimate_max_episode_seconds(
@@ -136,29 +138,38 @@ class SentryStrategy(RolloutStrategy):
                 if self._handle_warmup(cfg.use_torch_compile, timer):
                     continue
 
+                self._view_mask_tick(ctx, runnable=True)
+                if self._view_mask_failed_should_stop(ctx):
+                    break
                 step = send_next_action(obs_processed, obs, ctx, interpolator, timer)
 
                 if step is not None:
                     action_dict = transition_to_robot_action(step)
                     with timer.section("telemetry"):
                         self._log_telemetry(obs_processed, step, ctx.runtime)
+                        self._log_view_mask(ctx.runtime)
                     # Record once per interpolation cycle so the dataset cadence
                     # matches its declared fps; interpolated ticks only send
                     # commands to the robot.
                     if interpolator.emitted_policy_action:
-                        with timer.section("record"):
-                            obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
-                            action_frame = build_dataset_frame(features, action_dict, prefix=ACTION)
-                            # Label with ``dispatched_task``, the instruction that generated the action just
-                            # sent (the live ``engine.task`` would mislabel actions still queued from the
-                            # previous one); sound at any multiplier, since no ``get_action`` has run since
-                            # the refill tick that produced this action.
-                            frame = {**obs_frame, **action_frame, "task": engine.dispatched_task}
-                            # ``add_frame`` writes to the in-progress episode buffer; the
-                            # background pusher only ever touches *finalised* episode
-                            # artifacts on disk.  The two operate on disjoint state, so
-                            # ``add_frame`` does not need ``_episode_lock``.
-                            dataset.add_frame(frame)
+                        mask_fields = self._view_mask_frame_fields(human=False)
+                        if mask_fields is not None or self._view_mask is None:
+                            with timer.section("record"):
+                                obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
+                                action_frame = build_dataset_frame(features, action_dict, prefix=ACTION)
+                                # Label with ``dispatched_task``, the instruction that generated the action just
+                                # sent (the live ``engine.task`` would mislabel actions still queued from the
+                                # previous one); sound at any multiplier, since no ``get_action`` has run since
+                                # the refill tick that produced this action.
+                                frame = {**obs_frame, **action_frame, "task": engine.dispatched_task}
+                                if mask_fields is not None:
+                                    frame.update(mask_fields)
+                                # ``add_frame`` writes to the in-progress episode buffer; the
+                                # background pusher only ever touches *finalised* episode
+                                # artifacts on disk.  The two operate on disjoint state, so
+                                # ``add_frame`` does not need ``_episode_lock``.
+                                dataset.add_frame(frame)
+                                self._note_recorded_frame(dataset)
 
                 # Episode rotation derived from video file-size target.
                 # The duration is a conservative estimate so the actual

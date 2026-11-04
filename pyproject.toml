@@ -439,7 +439,7 @@ explicit = true
 [tool.uv.sources]
 # LeRobot decodes videos on CPU; avoid GPU-only TorchCodec dependencies without changing GPU training.
 torchcodec = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'arm64')" }]
-openpi-client = { path = "/home/gsp/Dev/Manipulation/openpi/packages/openpi-client", editable = true }
+openpi-client = { path = "../openpi/packages/openpi-client", editable = true }
 
 [tool.setuptools.package-data]
 lerobot = ["envs/*.json", "annotations/steerable_pipeline/prompts/*.txt", "configs/recipes/*.yaml"]

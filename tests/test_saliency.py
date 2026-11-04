@@ -33,7 +33,7 @@ from lerobot.utils.constants import (  # noqa: E402
 
 
 def test_validate_saliency_requires_rtc_engine():
-    from lerobot.rollout.inference import SyncInferenceConfig
+    from lerobot.inference import SyncInferenceConfig
     from lerobot.rollout.saliency.config import SaliencyConfig, validate_saliency
 
     with pytest.raises(ValueError, match="inference.type=rtc"):
@@ -41,7 +41,7 @@ def test_validate_saliency_requires_rtc_engine():
 
 
 def test_validate_saliency_rejects_unknown_method():
-    from lerobot.rollout.inference import RTCInferenceConfig
+    from lerobot.inference import RTCInferenceConfig
     from lerobot.rollout.saliency.config import SaliencyConfig, validate_saliency
 
     cfg = SaliencyConfig(enabled=True, method="integrated")
@@ -50,7 +50,7 @@ def test_validate_saliency_rejects_unknown_method():
 
 
 def test_validate_saliency_rejects_unknown_norm_scope():
-    from lerobot.rollout.inference import RTCInferenceConfig
+    from lerobot.inference import RTCInferenceConfig
     from lerobot.rollout.saliency.config import SaliencyConfig, validate_saliency
 
     assert SaliencyConfig().norm_scope == "run"  # default: one online scale for the whole run
@@ -60,7 +60,7 @@ def test_validate_saliency_rejects_unknown_norm_scope():
 
 
 def test_validate_saliency_requires_rerun_for_display():
-    from lerobot.rollout.inference import RTCInferenceConfig
+    from lerobot.inference import RTCInferenceConfig
     from lerobot.rollout.saliency.config import SaliencyConfig, validate_saliency
 
     with pytest.raises(ValueError, match="rerun"):
@@ -68,7 +68,7 @@ def test_validate_saliency_requires_rerun_for_display():
 
 
 def test_validate_saliency_requires_display_data_for_display():
-    from lerobot.rollout.inference import RTCInferenceConfig
+    from lerobot.inference import RTCInferenceConfig
     from lerobot.rollout.saliency.config import SaliencyConfig, validate_saliency
 
     # display_data=False but saliency.display=True → rerun never initialized, silent no-op
@@ -79,7 +79,7 @@ def test_validate_saliency_requires_display_data_for_display():
 def test_validate_saliency_warns_on_torch_compile(caplog):
     import logging as _logging
 
-    from lerobot.rollout.inference import RTCInferenceConfig
+    from lerobot.inference import RTCInferenceConfig
     from lerobot.rollout.saliency.config import SaliencyConfig, validate_saliency
 
     with caplog.at_level(_logging.WARNING):
@@ -90,7 +90,7 @@ def test_validate_saliency_warns_on_torch_compile(caplog):
 
 
 def test_validate_saliency_passes_when_disabled():
-    from lerobot.rollout.inference import SyncInferenceConfig
+    from lerobot.inference import SyncInferenceConfig
     from lerobot.rollout.saliency.config import SaliencyConfig, validate_saliency
 
     validate_saliency(SaliencyConfig(enabled=False), SyncInferenceConfig(), "foxglove", False)
@@ -105,7 +105,7 @@ def test_validate_saliency_passes_when_disabled():
     ],
 )
 def test_validate_saliency_rejects_invalid_attention_selectors(field, value, message):
-    from lerobot.rollout.inference import RTCInferenceConfig
+    from lerobot.inference import RTCInferenceConfig
     from lerobot.rollout.saliency.config import SaliencyConfig, validate_saliency
 
     cfg = SaliencyConfig(enabled=True, method="attention")
@@ -115,7 +115,7 @@ def test_validate_saliency_rejects_invalid_attention_selectors(field, value, mes
 
 
 def test_validate_saliency_selectors_are_attention_only():
-    from lerobot.rollout.inference import RTCInferenceConfig
+    from lerobot.inference import RTCInferenceConfig
     from lerobot.rollout.saliency.config import SaliencyConfig, validate_saliency
 
     with pytest.raises(ValueError, match="require.*attention"):
@@ -1009,7 +1009,7 @@ def test_attention_explainer_is_registered_for_attention_method():
 
 
 def test_validate_saliency_accepts_attention_method():
-    from lerobot.rollout.inference import RTCInferenceConfig, SyncInferenceConfig
+    from lerobot.inference import RTCInferenceConfig, SyncInferenceConfig
     from lerobot.rollout.saliency.config import SaliencyConfig, validate_saliency
 
     validate_saliency(SaliencyConfig(enabled=True, method="attention"), RTCInferenceConfig(), "rerun", True)
@@ -1900,7 +1900,7 @@ def test_recorder_chunk_scope_rescales_per_chunk(tmp_path, monkeypatch):
 
 
 def test_build_saliency_snapshot_clones_tensors():
-    from lerobot.rollout.inference.rtc import _build_saliency_snapshot
+    from lerobot.inference.rtc import _build_saliency_snapshot
 
     imgs = torch.rand(1, 3, 8, 8)
     noise = torch.rand(1, 10, 4)
@@ -1931,7 +1931,7 @@ def test_build_saliency_snapshot_clones_tensors():
 
 
 def test_build_saliency_snapshot_handles_none_optionals():
-    from lerobot.rollout.inference.rtc import _build_saliency_snapshot
+    from lerobot.inference.rtc import _build_saliency_snapshot
 
     snap = _build_saliency_snapshot({}, noise=None, inference_delay=0, prev_chunk_left_over=None)
     assert snap["noise"] is None
@@ -1942,7 +1942,7 @@ def test_build_saliency_snapshot_handles_none_optionals():
 def test_accepts_noise_injection_probes_noise_kwarg():
     """The saliency build-time probe must reject RTC-capable policies whose
     predict_action_chunk lacks the noise parameter (they would TypeError mid-loop)."""
-    from lerobot.rollout.inference.rtc import accepts_noise_injection
+    from lerobot.inference.rtc import accepts_noise_injection
 
     class _NoiseCapable:
         def predict_action_chunk(self, batch, inference_delay=None, prev_chunk_left_over=None, noise=None):

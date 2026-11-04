@@ -41,8 +41,15 @@ set by rollout_ee6d.sh):
 
 import os
 
+from bimanual_kinematic_processor import (
+    BimanualForwardKinematicsJointsToEEAction,
+    BimanualForwardKinematicsJointsToEEObservation,
+    BimanualInverseKinematicsEEToJoints,
+)
+
 from lerobot.cameras.opencv import OpenCVCameraConfig
 from lerobot.configs import PreTrainedConfig
+from lerobot.inference import RTCInferenceConfig
 from lerobot.lerobot_types import RobotAction, RobotObservation
 from lerobot.model.kinematics import RobotKinematics
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
@@ -56,17 +63,11 @@ from lerobot.processor import (
 from lerobot.robots.bi_so_follower.config_bi_so_follower import BiSOFollowerConfig
 from lerobot.robots.so_follower.config_so_follower import SOFollowerConfig
 from lerobot.rollout import BaseStrategyConfig, RolloutConfig, build_rollout_context
-from lerobot.rollout.inference import RTCInferenceConfig
 from lerobot.rollout.strategies import BaseStrategy
 from lerobot.utils.process import ProcessSignalHandler
 from lerobot.utils.utils import init_logging
 from lerobot.utils.visualization_utils import init_visualization, shutdown_visualization
 
-from bimanual_kinematic_processor import (
-    BimanualForwardKinematicsJointsToEEAction,
-    BimanualForwardKinematicsJointsToEEObservation,
-    BimanualInverseKinematicsEEToJoints,
-)
 
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
@@ -112,7 +113,9 @@ RENAME_MAP = {
 def main():
     init_logging()
 
-    cam = lambda path: OpenCVCameraConfig(index_or_path=path, width=1280, height=720, fps=FPS, fourcc="MJPG")
+    def cam(path):
+        return OpenCVCameraConfig(index_or_path=path, width=1280, height=720, fps=FPS, fourcc="MJPG")
+
     robot_config = BiSOFollowerConfig(
         left_arm_config=SOFollowerConfig(
             port=LEFT_FOLLOWER_PORT, use_degrees=False, cameras={"wrist": cam(LEFT_WRIST_CAM)}
@@ -133,9 +136,7 @@ def main():
 
     robot_joints_to_ee = RobotProcessorPipeline[RobotObservation, RobotObservation](
         steps=[
-            BimanualForwardKinematicsJointsToEEObservation(
-                kinematics=kinematics, motor_names=ARM_JOINT_NAMES
-            )
+            BimanualForwardKinematicsJointsToEEObservation(kinematics=kinematics, motor_names=ARM_JOINT_NAMES)
         ],
         to_transition=observation_to_transition,
         to_output=transition_to_observation,
@@ -150,9 +151,7 @@ def main():
         to_output=transition_to_robot_action,
     )
     teleop_joints_to_ee = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
-        steps=[
-            BimanualForwardKinematicsJointsToEEAction(kinematics=kinematics, motor_names=ARM_JOINT_NAMES)
-        ],
+        steps=[BimanualForwardKinematicsJointsToEEAction(kinematics=kinematics, motor_names=ARM_JOINT_NAMES)],
         to_transition=robot_action_observation_to_transition,
         to_output=transition_to_robot_action,
     )

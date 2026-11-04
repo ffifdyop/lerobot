@@ -1,0 +1,57 @@
+{
+  "status": "passed",
+  "tests": 3,
+  "duration_seconds": 55.02,
+  "worktree": "/home/gsp/.codex/worktrees/upstream-rebase/lerobot",
+  "physical_gpus": [
+    0,
+    2
+  ],
+  "cases": [
+    {
+      "case": "ddp_terminal_sigint",
+      "ranks": [
+        {
+          "signum": 2,
+          "step": 4,
+          "group_initialized": false
+        },
+        {
+          "signum": 2,
+          "step": 4,
+          "group_initialized": false
+        }
+      ]
+    },
+    {
+      "case": "fsdp_terminal_sigint",
+      "ranks": [
+        {
+          "signum": 2,
+          "step": 3,
+          "group_initialized": false
+        },
+        {
+          "signum": 2,
+          "step": 3,
+          "group_initialized": false
+        }
+      ]
+    },
+    {
+      "case": "fsdp_rank0_sigterm",
+      "ranks": [
+        {
+          "signum": 15,
+          "step": 3,
+          "group_initialized": false
+        },
+        {
+          "signum": 15,
+          "step": 3,
+          "group_initialized": false
+        }
+      ]
+    }
+  ]
+}

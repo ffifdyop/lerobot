@@ -70,6 +70,8 @@ class HighlightStrategy(RolloutStrategy):
     def setup(self, ctx: RolloutContext) -> None:
         """Initialise the inference engine, ring buffer, and keyboard listener."""
         self._init_engine(ctx)
+        self._attach_view_mask(ctx)
+        self._view_mask_dataset = ctx.data.dataset if self._view_mask is not None else None
 
         self._ring = RolloutRingBuffer(
             max_seconds=self.config.ring_buffer_seconds,
@@ -128,12 +130,16 @@ class HighlightStrategy(RolloutStrategy):
                     if self._handle_warmup(cfg.use_torch_compile, timer):
                         continue
 
+                    self._view_mask_tick(ctx, runnable=True)
+                    if self._view_mask_failed_should_stop(ctx):
+                        break
                     step = send_next_action(obs_processed, obs, ctx, interpolator, timer)
 
                     if step is not None:
                         action_dict = transition_to_robot_action(step)
                         with timer.section("telemetry"):
                             self._log_telemetry(obs_processed, step, ctx.runtime)
+                            self._log_view_mask(ctx.runtime)
 
                         if self._push_requested.is_set():
                             self._push_requested.clear()
@@ -146,11 +152,16 @@ class HighlightStrategy(RolloutStrategy):
                         # only send commands to the robot.  Save toggles are also
                         # handled here so an episode boundary always lands on a
                         # recorded frame.
-                        if interpolator.emitted_policy_action:
+                        mask_fields = self._view_mask_frame_fields(human=False)
+                        if interpolator.emitted_policy_action and (
+                            mask_fields is not None or self._view_mask is None
+                        ):
                             with timer.section("record"):
                                 obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
                                 action_frame = build_dataset_frame(features, action_dict, prefix=ACTION)
                                 frame = {**obs_frame, **action_frame, "task": engine.dispatched_task}
+                                if mask_fields is not None:
+                                    frame.update(mask_fields)
 
                                 toggled = False
                                 frame_consumed = False
@@ -186,6 +197,7 @@ class HighlightStrategy(RolloutStrategy):
                                 if not frame_consumed:
                                     if self._recording_live.is_set():
                                         dataset.add_frame(frame)
+                                        self._note_recorded_frame(dataset)
                                     else:
                                         ring.append(frame)
 

@@ -533,6 +533,7 @@ class ChunkRuntime:
                 "session_id",
                 "server_instance_id",
                 "artifact_identity",
+                "view_mask_revision",
             )
         )
 

@@ -102,6 +102,8 @@ class EpisodicStrategy(RolloutStrategy):
             else:
                 logger.info("Propagating --duration=%s to --dataset.episode_time_s", cfg.duration)
                 dataset_cfg.episode_time_s = cfg.duration
+        self._attach_view_mask(ctx)
+        self._view_mask_dataset = ctx.data.dataset if self._view_mask is not None else None
         self._listener, self._events = init_keyboard_listener()
         logger.info("Episodic strategy ready")
 
@@ -273,12 +275,17 @@ class EpisodicStrategy(RolloutStrategy):
             if self._handle_warmup(ctx.runtime.cfg.use_torch_compile, timer):
                 continue
 
+            self._view_mask_tick(ctx, runnable=True)
+            if self._view_mask_failed_should_stop(ctx):
+                break
             step = send_next_action(obs_processed, obs, ctx, interpolator, timer)
 
-            if step is not None:
+            mask_fields = self._view_mask_frame_fields(human=False)
+            if step is not None and (mask_fields is not None or self._view_mask is None):
                 action_dict = transition_to_robot_action(step)
                 with timer.section("telemetry"):
                     self._log_telemetry(obs_processed, step, ctx.runtime)
+                    self._log_view_mask(ctx.runtime)
                 # Record once per interpolation cycle so the dataset cadence
                 # matches its declared fps; interpolated ticks only send
                 # commands to the robot.
@@ -286,9 +293,11 @@ class EpisodicStrategy(RolloutStrategy):
                     with timer.section("record"):
                         obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
                         action_frame = build_dataset_frame(features, action_dict, prefix=ACTION)
-                        dataset.add_frame(
-                            {**obs_frame, **action_frame, "task": self._require_engine().dispatched_task}
-                        )
+                        frame = {**obs_frame, **action_frame, "task": self._require_engine().dispatched_task}
+                        if mask_fields is not None:
+                            frame.update(mask_fields)
+                        dataset.add_frame(frame)
+                        self._note_recorded_frame(dataset)
 
             self._require_engine().pump_query(obs_processed)
             timer.wait()

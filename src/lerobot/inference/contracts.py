@@ -125,6 +125,7 @@ class ActionProvenance:
     session_id: str = ""
     server_instance_id: str = ""
     artifact_identity: str = ""
+    view_mask_revision: int | None = None
 
 
 @dataclass(frozen=True)

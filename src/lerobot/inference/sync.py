@@ -36,11 +36,12 @@ from lerobot.utils import OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
 
 from .base import InferenceEngine, PolicyQuery
+from .view_mask import ViewMaskInferenceMixin, stamp_view_mask
 
 logger = logging.getLogger(__name__)
 
 
-class SyncInferenceEngine(InferenceEngine):
+class SyncInferenceEngine(ViewMaskInferenceMixin, InferenceEngine):
     """Inline synchronous inference: compute one action per call.
 
     ``get_action`` runs the full policy pipeline (pre/post-processor +
@@ -108,6 +109,7 @@ class SyncInferenceEngine(InferenceEngine):
             else nullcontext()
         )
         task, task_changed = self._take_task()
+        mask = self._view_mask.snapshot() if self._view_mask is not None else None
         with torch.inference_mode(), autocast_ctx:
             if task_changed:
                 # Chunking policies queue actions computed under the previous instruction,
@@ -119,10 +121,14 @@ class SyncInferenceEngine(InferenceEngine):
             measure = self.latency.interval_s > 0 and self._policy.count_queued_actions() == 0
             started = time.monotonic() if measure else 0.0
             observation = prepare_observation_for_inference(observation, self._device, task, self._robot_type)
+            if mask is not None:
+                stamp_view_mask(observation, mask)
             observation = self._preprocessor(observation)
             transition = policy_output_to_transition(self._policy.select_action(observation))
             # Only the action goes through the postprocessor; the prediction travels beside it.
             action = self._postprocessor(transition_to_policy_action(transition))
+        if mask is not None and not self._view_mask.is_executable(mask.revision):
+            return None
         action_tensor = action.squeeze(0).cpu()
         if measure:
             completed = time.monotonic()
@@ -131,10 +137,28 @@ class SyncInferenceEngine(InferenceEngine):
         # ``task`` is the pre-inference snapshot: a /subtask landing mid-inference must
         # not relabel this action.
         self._set_dispatched_task(task)
+        if mask is not None:
+            self._view_mask.set_dispatched(mask)
+            self._view_mask.mark_active(mask)
         # Policy's own dimension order — the order ``send_next_action`` labels it with.
         if not (prediction := transition_to_prediction(transition)):
             return action_tensor
         return create_transition(action=action_tensor, prediction=prediction)
+
+    def reset_for_mask_transition(self) -> None:
+        """View Mask Inference Flush.
+
+        Sync has no queue to drain — it recomputes from the observation every tick —
+        but chunking policies keep an internal action queue from ``select_action``,
+        and the processors may carry history (Diffusion-family observation queues).
+        Clearing the same state ``reset`` clears, minus the task edge, is what makes
+        the next returned action fresh for the new mask.
+        """
+        logger.info("Sync inference: flushing policy and processors for the new view mask")
+        self.drop_pending_query()
+        self._policy.reset()
+        self._preprocessor.reset()
+        self._postprocessor.reset()
 
     def dispatch_allowed(self) -> bool:
         """Permit dispatch unless an external planner has yet to issue its first instruction.
@@ -168,6 +192,8 @@ class SyncInferenceEngine(InferenceEngine):
         )
         # Live task, read without consuming the task-changed edge (the action path needs it).
         task = self.task
+        mask = self._view_mask.snapshot() if self._view_mask is not None else None
+        self._active_query_mask = mask
         # Generation blocks the control thread, so any precomputed chunk is stale by its
         # full duration afterwards. Drop it and resume from fresh inference, matching the
         # hold-and-invalidate rule of the asynchronous backends.
@@ -178,6 +204,8 @@ class SyncInferenceEngine(InferenceEngine):
             # Reusing the action path's preprocessor is safe only while its steps are
             # stateless per call; the one that is not (an enabled RelativeActionsProcessorStep)
             # is rejected for this backend at context-build time.
+            if mask is not None:
+                stamp_view_mask(observation, mask)
             observation = self._preprocessor(observation)
             # No str() coercion: _service_query validates the return value.
             return self._policy.generate_text(observation)

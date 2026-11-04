@@ -100,11 +100,11 @@ _避免_：Robot Reset（机器人复位）、Session Reset（会话复位）
 _避免_：First Chunk Action（RTC 下的 `a₀` 可能因推理延迟被丢弃）、Executed Action
 
 **Local Policy（本地策略）**：
-网络在本进程内运行的策略，其内部结构（梯度、attention）可直接检查。SmolVLA 是本地策略。
+网络在本进程内运行的策略，其内部结构（梯度、attention）可直接检查。SmolVLA 与原生 DM05 是本地策略。
 _避免_：离线策略
 
 **Remote Policy（远程策略）**：
-经网络（HTTP/websocket）服务的策略；rollout 进程只能看到观测 → 动作对，永远接触不到网络内部。DM05 与 openpi 策略是远程策略。
+经网络（HTTP/websocket）服务的策略；rollout 进程只能看到观测 → 动作对，无法直接检查网络内部。DM05 远程客户端（dm05_remote）与 openpi 客户端属于远程策略；DM05 这一模型名称本身不限定运行位置。
 
 **Observation Memory（MEM 观测记忆）**：
 π0.5 的可选扩展，使当前 Policy Proposal 可依赖抽样的历史相机观测和/或本体状态。它不是基础 π0.5 的默认语义。

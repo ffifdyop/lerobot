@@ -1,0 +1,42 @@
+{
+  "status": "passed",
+  "source_revision": "ba83e4cf43737e2665be0aafcb5f513b83c7d0f3",
+  "wrap_modules": [
+    "SiglipEncoderLayer"
+  ],
+  "parameter_count": 4143404816,
+  "layout": "fsdp",
+  "dp_shard": 2,
+  "world_size": 2,
+  "per_gpu_batch": 6,
+  "global_batch": 12,
+  "cameras": 3,
+  "image_size": 224,
+  "language_tokens": 200,
+  "action_horizon": 50,
+  "warmup_steps": 2,
+  "measured_steps": 3,
+  "precision": "bf16",
+  "gradient_checkpointing": true,
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "torch": "2.11.0+cu128",
+  "transformers": "5.22.1",
+  "accelerate": "1.14.0",
+  "huggingface_hub": "1.33.0",
+  "peak_allocated_gib_per_rank": [
+    35.23984146118164,
+    35.23984146118164
+  ],
+  "peak_reserved_gib_per_rank": [
+    60.0703125,
+    60.0703125
+  ],
+  "init_peak_allocated_gib_per_rank": [
+    23.17806625366211,
+    23.17806625366211
+  ],
+  "seconds_per_step": 1.3029989004135132,
+  "samples_per_second": 9.209524272193738,
+  "scope": "random full-size PI05, synthetic resident batches; excludes dataset I/O and checkpointing",
+  "comparison_note": "Same input shapes as the historical local benchmark; upstream has no train_on_padded_action_dims option and uses its native loss over the 14 configured action dimensions. No same-environment joint-layer comparison has been run."
+}
