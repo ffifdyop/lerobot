@@ -130,6 +130,7 @@ training = [
     "trackio[apple-gpu]>=0.44.0,<1.0.0; sys_platform == 'darwin'",
     "lerobot[accelerate-dep]",
 ]
+wandb = ["wandb>=0.19.0,<1.0.0"]
 hardware = [
     "lerobot[pynput-dep]",
     "lerobot[pyserial-dep]",

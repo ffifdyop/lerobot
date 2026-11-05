@@ -59,6 +59,7 @@ from lerobot.common.train_utils import (
     should_save_checkpoint,
     update_last_checkpoint,
 )
+from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import EvalConfig, JobConfig, parser
 from lerobot.configs.rewards import RewardModelConfig
 from lerobot.configs.train import CheckpointFormat, TrainPipelineConfig
@@ -564,7 +565,10 @@ def train(cfg: TrainPipelineConfig) -> None:
     if is_main_process():
         logging.info(pformat(cfg.to_dict()))
 
-    if cfg.trackio.enable and cfg.trackio.project and is_main_process():
+    trackio_logger: TrackioLogger | WandBLogger | None
+    if cfg.wandb_logging.enable and is_main_process():
+        trackio_logger = WandBLogger(cfg)
+    elif cfg.trackio.enable and cfg.trackio.project and is_main_process():
         trackio_logger = TrackioLogger(cfg)
     else:
         trackio_logger = None

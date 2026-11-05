@@ -133,6 +133,25 @@ TRACKIO_RESUME_MODES = frozenset({"allow", "must", "never"})
 
 
 @dataclass
+class WandBLoggingConfig:
+    """Optional W&B logging; separate from the legacy `wandb` checkpoint migration."""
+
+    enable: bool = False
+    project: str = "lerobot"
+    entity: str | None = None
+    run_name: str | None = None
+    run_id: str | None = None
+    mode: str = "online"
+    disable_artifact: bool = True
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"online", "offline", "disabled"}:
+            raise ValueError("wandb_logging.mode must be online, offline, or disabled")
+        if self.enable and not self.project.strip():
+            raise ValueError("wandb_logging.project must be nonempty when enabled")
+
+
+@dataclass
 class TrackioConfig:
     """Training run tracking with Trackio (https://huggingface.co/docs/trackio).
 

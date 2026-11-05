@@ -37,7 +37,7 @@ from lerobot.utils.hub import HubMixin, find_latest_hub_checkpoint
 from lerobot.utils.sample_weighting import SampleWeightingConfig
 
 from . import parser
-from .default import DatasetConfig, EvalConfig, JobConfig, PeftConfig, TrackioConfig
+from .default import DatasetConfig, EvalConfig, JobConfig, PeftConfig, TrackioConfig, WandBLoggingConfig
 from .policies import PreTrainedConfig
 from .rewards import RewardModelConfig
 
@@ -185,6 +185,7 @@ class TrainPipelineConfig(HubMixin):
     # pushed main branch use the EMA weights.
     ema: EMAConfig | None = None
     trackio: TrackioConfig = field(default_factory=TrackioConfig)
+    wandb_logging: WandBLoggingConfig = field(default_factory=WandBLoggingConfig)
     peft: PeftConfig | None = None
 
     # Where to run training (local default, or an HF Jobs flavor). See JobConfig.
@@ -279,6 +280,8 @@ class TrainPipelineConfig(HubMixin):
         # `base_model`); the resumed weights and processors load from `checkpoint_path`.
 
     def validate(self) -> None:
+        if self.trackio.enable and self.wandb_logging.enable:
+            raise ValueError("Enable only one training logger: trackio or wandb_logging")
         available_contexts = multiprocessing.get_all_start_methods()
         if (
             self.dataloader_multiprocessing_context is not None

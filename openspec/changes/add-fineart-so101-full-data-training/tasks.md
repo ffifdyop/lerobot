@@ -1,0 +1,20 @@
+## Implementation
+- [x] Add explicit setup/check/smoke/train launcher and native configuration generator.
+- [x] Document the full-data plan, checkpoint adaptation, commands, and evidence boundaries.
+- [x] Verify real dataset preflight, native config round-trip, and missing-subtask failure.
+- [x] Verify syntax, formatting, and OpenSpec validation.
+- [x] Leave environment setup, FAST fitting, GPU model loading, and training unrun.
+- [x] Add dual-DDP launch, parent-only FAST preparation, and rank-0 W&B backend with run-ID persistence.
+- [x] Add W&B dependency extra and update uv.lock without changing any existing package versions.
+- [x] Validate dual-GPU/W&B config parsing and rerun logger/compatibility checks.
+- [x] Expose editable training parameters and derive a five-epoch budget from actual training frames.
+- [x] Reuse native episode holdouts and restrict parent FAST fitting to training episodes.
+- [x] Verify batch/LR/split overrides, DDP step rounding, and native config serialization without training.
+- [x] Expose gradient checkpointing, LoRA rank/alpha, VLM/vision freezing, and peak/final LR controls.
+- [x] Validate native frozen-VLM loss rules, low-level routing, LoRA scope, and the actual LR scheduler.
+- [x] Default to selectable native two-GPU FSDP2, expose reshard/offload controls, and retain DDP fallback.
+- [x] Preserve user-edited batch/LR/step/checkpointing defaults and verify SigLIP-only child wrapping.
+- [x] Verify actual FSDP2/DDP/frozen-LoRA config checks and native CLI round-trips without GPU training.
+- [x] Expose dp_shard/dp_replicate, validate selected GPUs, and derive worker/batch/epoch counts from topology.
+- [x] Verify default FSDP and 2x2 HSDP checks, native config parsing, and multi-group CPU regressions.
+- [x] Add usage comments, dependency-free shell help, and actionable unknown-mode errors to the launcher.
