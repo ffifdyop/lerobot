@@ -32,6 +32,7 @@ from lerobot.rollout import (  # noqa: E402
     LinkedEvent,
     RolloutStrategy,
 )
+from lerobot.rollout.configs import TeleopTakeoverConfig
 
 
 class _FakeEngine(InferenceEngine):
@@ -89,10 +90,13 @@ def _loop_ctx(engine, robot=None, stop_event=None, **cfg_overrides):
         "use_torch_compile": False,
         "interpolation_multiplier": 1,
         "interactive": True,
+        "takeover": TeleopTakeoverConfig(),
         "status_interval_s": 5.0,
         "device": "cpu",
         "display_data": False,
         "autosteer_interval_s": 0.0,
+        "autosteer_goal": None,
+        "autosteer_startup_timeout_s": 2.0,
         "inference": SyncInferenceConfig(),
     }
     cfg.update(cfg_overrides)
@@ -106,6 +110,7 @@ def _loop_ctx(engine, robot=None, stop_event=None, **cfg_overrides):
         hardware=SimpleNamespace(
             robot_wrapper=robot if robot is not None else MagicMock(),
             teleop=None,
+            leader_follower=None,
             initial_position={"joint.pos": 0.0},
         ),
         processors=SimpleNamespace(

@@ -73,6 +73,7 @@ from lerobot.utils.import_utils import _peft_available, require_package
 from .configs import RolloutConfig
 from .planner import PlannerConfig, VlmPlanner, training_vocabulary
 from .robot_wrapper import ThreadSafeRobot
+from .takeover import LeaderFollower
 
 if TYPE_CHECKING or _peft_available:
     from peft import PeftConfig, PeftModel
@@ -216,6 +217,7 @@ class HardwareContext:
     robot_wrapper: ThreadSafeRobot
     teleop: Teleoperator | None
     initial_position: dict[str, float] | None = None
+    leader_follower: LeaderFollower | None = None
 
 
 @dataclass
@@ -337,6 +339,11 @@ def _prepare_rollout_devices(
     if require_hold:
         wrapper.configure_position_hold()
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
+    if cfg.takeover.enabled:
+        if teleop is None:
+            raise ValueError("Teleop takeover requires a leader")
+        # Validate capabilities before connecting devices or moving any motors.
+        LeaderFollower(wrapper, teleop, cfg.takeover, cfg.fps * cfg.interpolation_multiplier)
     return wrapper, teleop
 
 

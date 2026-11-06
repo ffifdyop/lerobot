@@ -492,6 +492,8 @@ def send_next_action(
     ctx: RolloutContext,
     interpolator: ActionInterpolator,
     timer: CycleTimer | None = None,
+    *,
+    cancelled: Callable[[], bool] | None = None,
 ) -> EnvTransition | None:
     """Dispatch the next action to the robot.
 
@@ -529,6 +531,11 @@ def send_next_action(
 
     predictions: list[PolicyPrediction] = []
 
+    if cancelled is not None and cancelled():
+        interpolator.reset()
+        hold()
+        return None
+
     # The gate/hold/acknowledge order is shared with other control loops through
     # ``lerobot.inference``; this helper adds the frame, processor and cadence stats.
     interp = next_interpolated_action(
@@ -547,6 +554,12 @@ def send_next_action(
     action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
     with section("send"):
         processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
+        # Sync inference can return after an interactive takeover/reset/stop request.
+        # Its pause() has no worker to revoke, so also check the segment boundary.
+        if cancelled is not None and cancelled():
+            interpolator.reset()
+            hold()
+            return None
         if not commit_action(engine, interpolator, lambda: wrapper.send_action(processed), hold=hold):
             return None
     return create_transition(action=action_dict, prediction=predictions[-1] if predictions else None)

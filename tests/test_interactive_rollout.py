@@ -1274,7 +1274,8 @@ def test_session_autosteer_reports_status_and_hands_control_back(capsys):
         thread = _start_session_thread(session)
 
         session._handle_line("/autosteer tidy the table")
-        assert "Not running" in capsys.readouterr().out
+        assert "Autosteer armed" in capsys.readouterr().out
+        assert not engine.seen_queries
 
         session._handle_line("/start")
         assert _wait_for(started.is_set)
@@ -1305,6 +1306,130 @@ def test_session_autosteer_reports_status_and_hands_control_back(capsys):
         assert session.controller.task == steady
 
         session._handle_line("/stop")
+        _join_session(thread)
+
+
+# --- Goal-only startup through real sync/RTC engines and the real action loop ---
+
+
+@pytest.mark.parametrize("backend", ["sync", "rtc"])
+@pytest.mark.parametrize(
+    "outcome", ["success", "same_text", "error", "empty", "cancel", "retarget", "timeout"]
+)
+def test_goal_startup_never_dispatches_before_an_accepted_subtask(backend, outcome):
+    from lerobot.inference import SyncInferenceEngine
+    from lerobot.rollout.strategies import BaseStrategy
+    from lerobot.utils.constants import QUERY_TEXT
+
+    features = {
+        "observation.state": {"dtype": "float32", "shape": (2,), "names": ["j1.pos", "j2.pos"]},
+        "action": {"dtype": "float32", "shape": (2,), "names": ["j1.pos", "j2.pos"]},
+    }
+    if backend == "rtc":
+        engine, policy = _make_rtc_engine()
+        policy.predict_action_chunk = lambda *args, **kwargs: torch.ones(1, 10, 2)
+    else:
+        policy = MagicMock()
+        policy.config.use_amp = False
+        policy.supports_text_generation.return_value = True
+        policy.select_action.return_value = torch.ones(1, 2)
+        engine = SyncInferenceEngine(
+            policy=policy,
+            preprocessor=_IdentityPipeline(),
+            postprocessor=_IdentityPipeline(),
+            dataset_features=features,
+            ordered_action_keys=["j1.pos", "j2.pos"],
+            task="task A",
+            device="cpu",
+            robot_type="mock",
+        )
+    entered, release, sent = Event(), Event(), Event()
+    queries, dispatched_tasks, events = [], [], []
+
+    def generate(batch):
+        goal = batch[QUERY_TEXT]
+        queries.append(goal)
+        if len(queries) == 1:
+            entered.set()
+            assert release.wait(2), "test must release the language call"
+        if outcome == "error":
+            raise RuntimeError("planner failed")
+        if outcome == "empty":
+            return ""
+        return "task A" if outcome == "same_text" else f"next for {goal}"
+
+    policy.generate_text = generate
+    robot = MagicMock(supports_hold=True, hardware_failure=None)
+    robot.get_observation.return_value = {"j1.pos": 0.0, "j2.pos": 0.0}
+
+    def send(action):
+        dispatched_tasks.append(engine.dispatched_task)
+        sent.set()
+
+    robot.send_action.side_effect = send
+    ctx = _loop_ctx(engine, robot, autosteer_goal="insert", autosteer_interval_s=1000)
+    if outcome == "timeout":
+        ctx.runtime.cfg.autosteer_startup_timeout_s = 0.05
+    ctx.data.dataset_features = features
+    ctx.data.ordered_action_keys = ["j1.pos", "j2.pos"]
+    ctx.processors.robot_action_processor = lambda pair: pair[0]
+    strategy = BaseStrategy(BaseStrategyConfig())
+    strategy.setup(ctx)
+    controller = RolloutController(strategy, ctx, on_event=lambda event, answer: events.append(event))
+    thread = _serve_thread(controller)
+    try:
+        assert not queries and not robot.send_action.called
+        assert controller.start()
+        assert entered.wait(2)
+        assert queries == ["insert"]
+        assert RolloutEvent.PLANNING_STARTED in events
+        assert RolloutEvent.SEGMENT_STARTED not in events
+        assert not robot.send_action.called
+        if outcome == "cancel":
+            controller.stop()
+        elif outcome == "retarget":
+            assert controller.autosteer("pull") is AskResult.QUEUED
+        elif outcome == "timeout":
+            time.sleep(0.08)
+        release.set()
+        if outcome in {"success", "same_text", "retarget"}:
+            assert sent.wait(2), controller.failure_traceback
+            expected = {"success": "next for insert", "same_text": "task A", "retarget": "next for pull"}
+            assert set(dispatched_tasks) == {expected[outcome]}
+            assert RolloutEvent.SEGMENT_STARTED in events
+            if outcome == "retarget":
+                assert queries == ["insert", "pull"]
+        else:
+            assert _wait_for(lambda: not controller.running)
+            assert not robot.send_action.called
+            assert RolloutEvent.SEGMENT_STARTED not in events
+            assert controller.failed is (outcome == "timeout")
+    finally:
+        release.set()
+        controller.stop()
+        _join_session(thread)
+        engine.stop()
+
+
+def test_startup_goal_is_replanned_after_reset_and_cleared_by_manual_control():
+    ctx, strategy, engine, _parent, run_started = _make_ctx()
+    ctx.runtime.cfg.autosteer_goal = "insert"
+    controller = RolloutController(strategy, ctx)
+    thread = _serve_thread(controller)
+    try:
+        assert controller.start()
+        assert run_started.wait(2)
+        assert engine.seen_queries == [(QueryKind.NEXT_SUBTASK, "insert")]
+        controller.reset()
+        assert _wait_for(lambda: strategy.return_to_initial_position.call_count == 1)
+        run_started.clear()
+        assert controller.start()
+        assert run_started.wait(2)
+        assert len(engine.seen_queries) == 2
+        controller.set_task("manual instruction")
+        assert controller.autosteer_goal is None
+    finally:
+        controller.stop()
         _join_session(thread)
 
 

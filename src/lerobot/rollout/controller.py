@@ -27,10 +27,12 @@ import time
 import traceback
 from collections.abc import Callable
 from enum import Enum
-from threading import Event, Lock
-from typing import TYPE_CHECKING
+from threading import Event, RLock
+from typing import TYPE_CHECKING, Literal
 
 from lerobot.inference import QueryAnswer
+
+from .takeover import AlignmentTimeoutError, LeaderFollower
 
 if TYPE_CHECKING:
     from .context import RolloutContext
@@ -93,11 +95,26 @@ class RolloutEvent(Enum):
     quick and must not call back into the controller's blocking methods.
     """
 
+    PLANNING_STARTED = "planning_started"
+    """A startup goal is being planned while policy-action dispatch remains inactive."""
+
     SEGMENT_STARTED = "segment_started"
     """A control-loop segment is about to run (control state freshly reset)."""
 
     SEGMENT_ENDED = "segment_ended"
     """The segment returned on its own (e.g. ``--duration`` elapsed); the robot is holding."""
+
+    ALIGNMENT_STARTED = "alignment_started"
+    """The leader is aligning to the held follower before control changes."""
+
+    ALIGNMENT_FAILED = "alignment_failed"
+    """Alignment timed out; no policy or manual motion was enabled."""
+
+    TELEOP_STARTED = "teleop_started"
+    """Alignment completed and the human now controls the follower."""
+
+    TELEOP_ENDED = "teleop_ended"
+    """Manual action dispatch stopped; the follower is held."""
 
     RESET_STARTED = "reset_started"
     """A reset is being executed: inference paused, robot about to move home."""
@@ -172,12 +189,27 @@ class RolloutController:
         self._on_event = on_event
         self._initial_task = ctx.policy.inference.task
         self._autosteer_interval_s = ctx.runtime.cfg.autosteer_interval_s
+        self._selected_autosteer_goal: str | None = None
+        self._leader_follower: LeaderFollower | None = None
+        if ctx.runtime.cfg.takeover.enabled:
+            teleop = ctx.hardware.teleop
+            if teleop is None:
+                raise ValueError("Teleop takeover requires a connected leader")
+            self._leader_follower = LeaderFollower(
+                ctx.hardware.robot_wrapper,
+                teleop,
+                ctx.runtime.cfg.takeover,
+                ctx.runtime.cfg.fps * ctx.runtime.cfg.interpolation_multiplier,
+            )
+            ctx.hardware.leader_follower = self._leader_follower
 
         # Serializes the control methods so multi-writer task updates keep their call order.
-        self._control_lock = Lock()
+        self._control_lock = RLock()
 
         # Written by control methods (any thread), consumed by the serve loop.
         self._start_requested = Event()
+        self._teleop_requested = Event()
+        self._teleoperating = Event()
         self._reset_requested = Event()
         self._stop_requested = Event()
         self._wake = Event()
@@ -189,6 +221,10 @@ class RolloutController:
         # Answers only leave the engine through pump_query(), called on the serve thread, so this
         # observer keeps the "events fire on the serve thread" guarantee.
         ctx.policy.inference.set_answer_observer(self._on_query_answer)
+        if (goal := ctx.runtime.cfg.autosteer_goal) is not None:
+            result = self.autosteer(goal)
+            if result is not AskResult.QUEUED:
+                raise ValueError(f"Cannot arm startup autosteer: {result.value}")
 
     # ------------------------------------------------------------------
     # Introspection
@@ -208,6 +244,15 @@ class RolloutController:
     def running(self) -> bool:
         """True while a control-loop segment is executing."""
         return self._running.is_set()
+
+    @property
+    def takeover_enabled(self) -> bool:
+        return self._leader_follower is not None
+
+    @property
+    def teleoperating(self) -> bool:
+        """True only after handover completed, while manual dispatch is enabled."""
+        return self._teleoperating.is_set()
 
     @property
     def stopped(self) -> bool:
@@ -237,11 +282,65 @@ class RolloutController:
         with self._control_lock:
             if self._stopped.is_set() or self._stop_requested.is_set() or self.failed:
                 return False
-            if self._running.is_set():
+            if self._running.is_set() or self._teleop_requested.is_set() or self._teleoperating.is_set():
                 return False
             self._start_requested.set()
             self._wake.set()
             return True
+
+    def teleop(self) -> bool:
+        """Request aligned human control, preserving the selected high-level goal."""
+        with self._control_lock:
+            if (
+                not self.takeover_enabled
+                or self._stopped.is_set()
+                or self._stop_requested.is_set()
+                or self._reset_requested.is_set()
+                or self._teleop_requested.is_set()
+                or self._teleoperating.is_set()
+                or self.failed
+            ):
+                return False
+            self._start_requested.clear()
+            self._teleop_requested.set()
+            engine = self._ctx.policy.inference
+            engine.stop_autosteer()
+            engine.pause()
+            engine.drop_pending_query()
+            self._segment_stop.set()
+            self._wake.set()
+            return True
+
+    def resume(self) -> bool:
+        """End human control and start a fresh policy segment, including fresh planning."""
+        with self._control_lock:
+            if (
+                not self._teleoperating.is_set()
+                or self._stopped.is_set()
+                or self._stop_requested.is_set()
+                or self._reset_requested.is_set()
+                or self.failed
+            ):
+                return False
+            self._teleop_requested.clear()
+            self._start_requested.set()
+            self._segment_stop.set()
+            self._wake.set()
+            return True
+
+    def toggle_teleop(self) -> Literal["teleop", "resume"] | None:
+        """Toggle only stable control modes; never queue a reversal during handover."""
+        with self._control_lock:
+            if self._start_requested.is_set():
+                return None
+            if self._teleoperating.is_set():
+                # resume/reset/stop has already cancelled this manual segment.
+                if not self._teleop_requested.is_set():
+                    return None
+                return "resume" if self.resume() else None
+            if self._teleop_requested.is_set() or not self._running.is_set():
+                return None
+            return "teleop" if self.teleop() else None
 
     def reset(self) -> bool:
         """Stop movement, return the robot to its initial position, restore the launch task.
@@ -256,6 +355,7 @@ class RolloutController:
             # Last command wins: cancel a pending start().  Flag first, segment-stop second
             # (see the ordering note in _run_segment).
             self._start_requested.clear()
+            self._teleop_requested.clear()
             # Back to square one, so the sequencer stops too: it would overwrite the restored task.
             self._ctx.policy.inference.stop_autosteer()
             # Restore here, not later on the serve thread, so a following set_task() survives.
@@ -272,6 +372,8 @@ class RolloutController:
             if self._stopped.is_set():
                 return
             self._start_requested.clear()  # last command wins, see reset()
+            self._teleop_requested.clear()
+            self._selected_autosteer_goal = None
             self._ctx.policy.inference.stop_autosteer()
             self._stop_requested.set()
             self._ctx.policy.inference.pause()
@@ -293,6 +395,7 @@ class RolloutController:
                 or self.text_input_error(task, instruction=True) is not None
             ):
                 return False
+            self._selected_autosteer_goal = None
             self._ctx.policy.inference.stop_autosteer()
             return self._ctx.policy.inference.set_task(task)
 
@@ -316,7 +419,7 @@ class RolloutController:
             return AskResult.INVALID
         with self._control_lock:
             # Same lock _run_segment clears _running under, so a question is never left orphaned.
-            if not self._running.is_set():
+            if not self._running.is_set() or self._teleop_requested.is_set() or self._segment_stop.is_set():
                 return AskResult.NOT_RUNNING
             if not self._ctx.policy.inference.ask(question):
                 return AskResult.BUSY
@@ -324,31 +427,40 @@ class RolloutController:
 
     @property
     def autosteer_goal(self) -> str | None:
-        """The high-level goal currently driving the task, if any."""
-        return self._ctx.policy.inference.autosteer_goal
+        """The high-level goal armed for startup or driving the current run."""
+        with self._control_lock:
+            return self._selected_autosteer_goal
 
     def autosteer(self, goal: str) -> AskResult:
         """Let the policy decompose ``goal`` and drive its own subtasks.
 
         Every ``autosteer_interval_s`` seconds the engine asks the policy for the next subtask and
         applies it through the *engine's* ``set_task``.  Plan progress lives in the policy, so the
-        sequencer does not survive a segment; it is also stopped by :meth:`reset` and
-        :meth:`set_task`.  Same guards and rejection values as :meth:`ask`.
+        sequencer does not survive a segment. The selected goal is re-armed on each
+        :meth:`start`, which waits for its first accepted subtask before entering the
+        action loop. Manual :meth:`set_task` and :meth:`stop_autosteer` clear the selection.
         """
         if not self._ctx.policy.inference.supports_text_queries:
             return AskResult.UNSUPPORTED
         if self.text_input_error(goal) is not None:
             return AskResult.INVALID
         with self._control_lock:
-            if not self._running.is_set():
+            if self._stopped.is_set() or self._stop_requested.is_set() or self.failed:
                 return AskResult.NOT_RUNNING
-            self._ctx.policy.inference.start_autosteer(goal, self._autosteer_interval_s)
+            self._selected_autosteer_goal = goal
+            if (
+                self._running.is_set()
+                and not self._teleop_requested.is_set()
+                and not self._segment_stop.is_set()
+            ):
+                self._ctx.policy.inference.start_autosteer(goal, self._autosteer_interval_s)
             return AskResult.QUEUED
 
     def stop_autosteer(self) -> str | None:
         """Stop the sequencer, returning the goal it was driving (or ``None``)."""
         with self._control_lock:
-            return self._ctx.policy.inference.stop_autosteer()
+            selected, self._selected_autosteer_goal = self._selected_autosteer_goal, None
+            return self._ctx.policy.inference.stop_autosteer() or selected
 
     # ------------------------------------------------------------------
     # Serve loop (blocks the calling thread)
@@ -380,6 +492,9 @@ class RolloutController:
                     self._reset_requested.clear()
                     self._reset_robot()
                     continue
+                if self._teleop_requested.is_set():
+                    self._run_teleop()
+                    continue
                 if self._start_requested.is_set():
                     # Consume the request and mark the segment running in one atomic step, so a
                     # concurrent start() cannot re-arm the flag behind the running segment.
@@ -397,6 +512,14 @@ class RolloutController:
                 self._wake.wait(timeout=self._POLL_INTERVAL_S)
                 self._wake.clear()
         finally:
+            if self._leader_follower is not None:
+                try:
+                    self._leader_follower.release()
+                except Exception:
+                    if self._strategy_failure_traceback is None:
+                        self._strategy_failure_traceback = traceback.format_exc()
+                    logger.exception("Could not release leader torque")
+                self._leader_follower.failed = self.failed
             # Latch before announcing, so an observer reacting to STOPPED sees a stopped controller.
             self._stopped.set()
             self._emit(RolloutEvent.STOPPED)
@@ -416,14 +539,24 @@ class RolloutController:
             if (
                 self._stop_requested.is_set()
                 or self._reset_requested.is_set()
+                or self._teleop_requested.is_set()
                 or self._global_shutdown.is_set()
                 or engine.failed
             ):
                 return
-            self._strategy.reset_control_state()
-            self._emit(RolloutEvent.SEGMENT_STARTED)
             try:
-                self._strategy.run(self._ctx)
+                if not self._align_leader():
+                    return
+                with self._control_lock:
+                    if self._segment_stop.is_set():
+                        return
+                    self._strategy.reset_control_state()
+                    goal = self._selected_autosteer_goal
+                    if goal is not None:
+                        engine.start_autosteer(goal, self._autosteer_interval_s)
+                if (goal is None or self._plan_before_motion()) and not self._segment_stop.is_set():
+                    self._emit(RolloutEvent.SEGMENT_STARTED)
+                    self._strategy.run(self._ctx)
             except Exception:
                 # Route to the same public failure surface as an engine failure, instead of
                 # unwinding through serve() as a clean-looking STOPPED.
@@ -439,6 +572,13 @@ class RolloutController:
                     if self._strategy_failure_traceback is None:
                         self._strategy_failure_traceback = traceback.format_exc()
                     logger.exception("Could not apply segment-end hold; skipping further shutdown movement")
+                if self._leader_follower is not None and not self._teleop_requested.is_set():
+                    try:
+                        self._leader_follower.release()
+                    except Exception:
+                        if self._strategy_failure_traceback is None:
+                            self._strategy_failure_traceback = traceback.format_exc()
+                        logger.exception("Could not release leader after policy segment")
         finally:
             # Clear and drop together under the control lock: ask() gates on _running under the same
             # lock, so a question either lands before this and is dropped, or is rejected outright.
@@ -456,9 +596,112 @@ class RolloutController:
         if engine.failed or self._strategy_failure_traceback is not None:
             return  # the serve loop emits the failure event and shuts down
         if not (
-            self._stop_requested.is_set() or self._reset_requested.is_set() or self._global_shutdown.is_set()
+            self._stop_requested.is_set()
+            or self._reset_requested.is_set()
+            or self._teleop_requested.is_set()
+            or self._global_shutdown.is_set()
         ):
             self._emit(RolloutEvent.SEGMENT_ENDED)
+
+    def _plan_before_motion(self) -> bool:
+        """Capture observations and service language without calling the action loop.
+
+        Async policy workers may run, but no policy action is pulled or dispatched here.
+        Their usual acknowledged local hold and query-generation checks remain in force.
+        Cancellation, failure, completion without a subtask, or timeout leaves the robot idle.
+        """
+        ctx = self._ctx
+        engine = ctx.policy.inference
+        self._emit(RolloutEvent.PLANNING_STARTED)
+        if engine.external_text is None:
+            engine.resume()
+        deadline = time.monotonic() + ctx.runtime.cfg.autosteer_startup_timeout_s
+        while not self._segment_stop.is_set() and not engine.failed:
+            # Run deadline checks and acknowledge a language hold before capturing its view.
+            engine.dispatch_allowed()
+            self._strategy.hold_control_state(ctx.hardware)
+            obs = ctx.hardware.robot_wrapper.get_observation()
+            if self._leader_follower is not None:
+                self._leader_follower.sync(obs)
+            processed = ctx.processors.robot_observation_processor(obs)
+            engine.notify_observation(processed)
+            engine.pump_query(processed)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Initial subtask generation timed out; no policy actions were dispatched")
+            with self._control_lock:
+                if self._segment_stop.is_set() or engine.failed:
+                    return False
+                if engine.autosteer_has_subtask:
+                    return True
+                if engine.autosteer_goal is None:
+                    return False
+            self._segment_stop.wait(min(1.0 / ctx.runtime.cfg.fps, self._POLL_INTERVAL_S))
+        return False
+
+    def _align_leader(self) -> bool:
+        if self._leader_follower is None:
+            return True
+        self._emit(RolloutEvent.ALIGNMENT_STARTED)
+        try:
+            return self._leader_follower.align(self._segment_stop)
+        except AlignmentTimeoutError:
+            logger.warning("Leader alignment timed out; keeping follower held")
+            self._emit(RolloutEvent.ALIGNMENT_FAILED)
+            return False
+
+    def _run_teleop(self) -> None:
+        """One manual segment on the same thread as policy dispatch (never concurrent)."""
+        ctx = self._ctx
+        engine = ctx.policy.inference
+        leader = self._leader_follower
+        assert leader is not None
+        try:
+            self._segment_stop.clear()
+            if (
+                not self._teleop_requested.is_set()
+                or self._reset_requested.is_set()
+                or self._stop_requested.is_set()
+                or self._global_shutdown.is_set()
+                or self.failed
+            ):
+                return
+            engine.pause()
+            self._strategy.hold_control_state(ctx.hardware)
+            self._strategy.reset_control_state()
+            if not self._align_leader():
+                return
+            # Listener commands can cancel while the last hardware read is in flight.
+            if self._segment_stop.is_set():
+                return
+            leader.release()
+            self._teleoperating.set()
+            self._emit(RolloutEvent.TELEOP_STARTED)
+            while not self._segment_stop.is_set() and not engine.failed:
+                started = time.monotonic()
+                obs = ctx.hardware.robot_wrapper.get_observation()
+                action = leader.positions(leader.teleop.get_action())
+                processed = ctx.processors.teleop_action_processor((action, obs))
+                target = ctx.processors.robot_action_processor((processed, obs))
+                if self._segment_stop.is_set():
+                    break
+                ctx.hardware.robot_wrapper.send_action(target)
+                self._segment_stop.wait(max(0.0, leader.period - (time.monotonic() - started)))
+        except Exception:
+            self._strategy_failure_traceback = traceback.format_exc()
+            logger.exception("Interactive teleoperation failed")
+        finally:
+            with self._control_lock:
+                self._teleop_requested.clear()
+                self._teleoperating.clear()
+            try:
+                engine.pause()
+                self._strategy.hold_control_state(ctx.hardware)
+                leader.release()
+            except Exception:
+                if self._strategy_failure_traceback is None:
+                    self._strategy_failure_traceback = traceback.format_exc()
+                logger.exception("Could not finish teleoperation hold/release")
+            self._emit(RolloutEvent.TELEOP_ENDED)
 
     def _reset_robot(self) -> None:
         """Pause inference and return the robot home (the task was restored by :meth:`reset`)."""

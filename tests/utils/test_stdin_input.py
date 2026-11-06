@@ -154,3 +154,115 @@ def test_stdin_listener_unusable_stream_treated_as_eof(monkeypatch):
     missing.start()
     assert missing_eof.is_set()
     missing.stop()
+
+
+@contextlib.contextmanager
+def _terminal_stream():
+    """A real POSIX pseudo-terminal, with no display server or keyboard permissions."""
+    if os.name != "posix":
+        pytest.skip("POSIX terminal required")
+    master, slave = os.openpty()
+    reader = os.fdopen(slave, "r", encoding="utf-8")
+    try:
+        yield master, reader
+    finally:
+        reader.close()
+        os.close(master)
+
+
+def test_terminal_space_is_immediate_and_repeats_are_suppressed(monkeypatch):
+    termios = pytest.importorskip("termios")
+
+    import lerobot.utils.stdin_input as stdin_input
+
+    now = [10.0]
+    monkeypatch.setattr(stdin_input, "monotonic", lambda: now[0])
+    taps, lines = [], []
+    with _terminal_stream() as (master, reader):
+        original = termios.tcgetattr(reader.fileno())
+        listener = StdinCommandListener(lines.append, stream=reader, on_space=lambda: taps.append(now[0]))
+        try:
+            listener.start()
+            active = termios.tcgetattr(reader.fileno())
+            assert not active[3] & (termios.ICANON | termios.ECHO)
+            assert active[3] & termios.ISIG == original[3] & termios.ISIG
+            assert listener.space_hotkey_enabled
+            os.write(master, b" ")  # No newline: must dispatch immediately.
+            assert _wait_for(lambda: len(taps) == 1)
+            now[0] += 0.5  # Typical first key-repeat delay.
+            os.write(master, b"   /help\n")
+            assert _wait_for(lambda: lines == ["/help"])
+            assert len(taps) == 1
+            now[0] += 0.8
+            os.write(master, b" ")
+            assert _wait_for(lambda: len(taps) == 2)
+        finally:
+            listener.stop()
+        assert termios.tcgetattr(reader.fileno()) == original
+
+
+def test_terminal_command_spaces_utf8_editing_and_ctrl_d():
+    termios = pytest.importorskip("termios")
+
+    lines, taps = [], []
+    eof = Event()
+    with _terminal_stream() as (master, reader):
+        original = termios.tcgetattr(reader.fileno())
+        listener = StdinCommandListener(
+            lines.append, stream=reader, on_space=lambda: taps.append(True), on_eof=eof.set
+        )
+        try:
+            listener.start()
+            os.write(master, "/autosteer 抓".encode()[:-1])  # Split inside a UTF-8 character.
+            os.write(master, "/autosteer 抓".encode()[-1:] + " 取x".encode() + b"\x7f\n")
+            os.write(master, b"/discard this\x15/subtask keep the cube\x1b[D\n")
+            assert _wait_for(lambda: len(lines) == 2)
+            assert lines == ["/autosteer 抓 取", "/subtask keep the cube"]
+            assert not taps
+            os.write(master, b"\x04")
+            assert eof.wait(2)
+            assert _wait_for(lambda: not listener._thread.is_alive())
+            assert termios.tcgetattr(reader.fileno()) == original
+        finally:
+            listener.stop()
+
+
+def test_space_callback_is_ignored_on_pipes():
+    taps, lines = [], []
+    with _pipe_stream() as (reader, writer):
+        listener = StdinCommandListener(lines.append, stream=reader, on_space=lambda: taps.append(True))
+        try:
+            listener.start()
+            assert not listener.space_hotkey_enabled
+            writer.write(" \n/teleop\n/resume\n")
+            writer.flush()
+            assert _wait_for(lambda: len(lines) == 2)
+            assert lines == ["/teleop", "/resume"]
+            assert not taps
+        finally:
+            listener.stop()
+
+
+def test_terminal_read_error_restores_mode(monkeypatch):
+    termios = pytest.importorskip("termios")
+
+    import lerobot.utils.stdin_input as stdin_input
+
+    eof = Event()
+    with _terminal_stream() as (_master, reader):
+        original = termios.tcgetattr(reader.fileno())
+
+        def broken_select(*args):
+            raise OSError("lost input")
+
+        monkeypatch.setattr(stdin_input.select, "select", broken_select)
+        listener = StdinCommandListener(
+            lambda line: None, stream=reader, on_space=lambda: None, on_eof=eof.set
+        )
+        try:
+            listener.start()
+            assert eof.wait(2)
+            assert _wait_for(lambda: not listener._thread.is_alive())
+            assert termios.tcgetattr(reader.fileno()) == original
+        finally:
+            listener.stop()

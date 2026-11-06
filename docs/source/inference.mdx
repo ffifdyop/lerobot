@@ -400,6 +400,8 @@ lerobot-rollout \
 | Command             | Action                                                                                                                                                                                                                                                                                                                  |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/start`            | Start (or restart) the policy control loop                                                                                                                                                                                                                                                                              |
+| `/teleop`           | With takeover enabled, pause policy/planning, align the leader, then enter human control |
+| `/resume`           | End human control, align the leader, and resume policy; an autosteer goal is replanned from the current scene |
 | `/subtask <text>`   | Change the instruction within the current run; asynchronous inference may enter a planned hold. No argument prints the current task. Only affects policies that condition on language (SmolVLA, π0/π0.5, and similar). With an [external planner](#external-planner), `/subtask` also hands control back from autosteer |
 | `/vqa <text>`       | Ask a question about what the robot currently sees. Only while a run is in progress, and only with a policy text head or an [external planner](#external-planner)                                                                                                                                                       |
 | `/autosteer <goal>` | Hand over a high-level goal and let the policy's text head or the [external planner](#external-planner) choose the subtasks. `/autosteer off` hands control back; no argument reports the current goal                                                                                                                  |
@@ -425,6 +427,62 @@ Robot reset — holding at initial position. /start to run.
 
 Lines starting with `>` are what you type; the session renders no prompt of its own.
 
+### Human takeover with continuous leader following
+
+For local `base` interactive rollout, add `--takeover.enabled=true` and a compatible
+`--teleop.*` configuration. No dataset is required. SO-101 and bimanual SO leader/follower
+pairs must use matching joint names, calibrated ranges, and `use_degrees` settings.
+The leader must support position feedback and torque control, and the follower must
+support position hold. DAgger and remote inference do not use this option.
+
+After `/start`, the leader first aligns to the held follower. During policy motion and
+startup planning, every control tick sends the follower's **measured joint positions**
+to the leader. This includes the left/right joints and grippers for `bi_so_leader`.
+The leader follows the measured pose, including tracking lag, rather than the policy's
+predicted target.
+
+On a focused POSIX terminal, **tap Space on an empty input line** to request human
+control; no Enter is needed. Once human control is active, tap Space again to resume
+the policy. `/teleop` and `/resume` remain available. Spaces inside a typed command
+such as `/autosteer pick up the cube` are ordinary text. Press Ctrl-U to clear an
+unfinished command before using Space. Keep taps at least 0.75 seconds apart; the
+terminal reader suppresses common key-repeat bursts. Repeated requests during handover
+are ignored. Space does nothing while idle before `/start`. Pipe/non-TTY input retains
+the line-command interface and does not enable the hotkey.
+
+Use Space or `/teleop` to request human control. The runtime pauses inference, discards old
+planning results, holds the follower, and checks leader/follower joint errors. **Wait
+for `Human control active` before moving the leader**: this message is emitted only
+after alignment and leader torque release. During human control, policy actions and
+automatic subtask generation remain stopped.
+
+Use Space again or `/resume` and release the leader for powered alignment. The runtime clears old
+action/interpolation state and, if an autosteer goal is selected, generates a new first
+subtask from the corrected scene before policy motion resumes. The overall goal is
+preserved. Without autosteer, the current manual subtask remains the instruction.
+`/reset`, `/stop`, EOF, and Ctrl-C retain their usual session semantics.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--takeover.enabled` | `false` | Enable leader following and interactive human control |
+| `--takeover.max_position_error` | `5.0` | Maximum measured absolute error for **each** joint before handover |
+| `--takeover.alignment_duration_s` | `1.0` | Initial/resume leader alignment ramp |
+| `--takeover.alignment_timeout_s` | `5.0` | Alignment deadline, greater than ramp duration |
+
+Errors use the robot interface's units: body joints use degrees when `use_degrees=true`
+or normalized −100…100 units otherwise; the SO gripper uses 0…100. A timeout leaves the
+follower held and reports alignment failure; it does not enable human control or
+automatically restart the policy. Correct the alignment and retry `/teleop` or `/start`.
+
+Hardware I/O runs on the control thread. An in-progress device call or synchronous
+model call must return before handover completes; this is not a hard real-time stop.
+RTC keeps model inference off that thread and remains the FineART script default.
+Additional leader serial traffic can affect cadence. Software tests cover command
+ownership and cancellation; actual tracking error, handover feel, grip retention,
+and control frequency require hardware validation.
+If an enabled takeover session fails, shutdown releases the leader and skips the
+automatic return-home move; a normal `/stop` still follows `--return_to_initial_position`.
+
 `Ctrl-C` still shuts down as usual, and closing stdin (`Ctrl-D`, or the end of a piped script) ends the session — so a piped script must keep stdin open for the intended duration:
 
 ```bash
@@ -440,6 +498,16 @@ With local `--use_torch_compile=true`, an instruction that changes processed ten
 **`/vqa`** answers from the next observation and prints when ready, so you can keep typing meanwhile; only one question is in flight at a time (autosteer's own queries share that slot). With an external planner the question is answered on a worker thread while the robot keeps acting, and nothing below applies. Asynchronous backends first enter an acknowledged local hold and invalidate queued/interpolated motion, then submit a fresh observation to the text path. A healthy active run resumes from a fresh action chunk after the answer; paused or stopped runs stay inactive. Synchronous text generation runs inline on the control thread and drops the policy's precomputed actions, so the next tick resumes from fresh inference. Query time counts against `--duration`. Questions are only accepted while a run is in progress — an idle engine has no current view. If the instruction or execution context invalidates an asynchronous answer, the question receives one cancellation notice instead of the obsolete answer. Segment end also reports unanswered questions, including generation still in progress; reporting cancellation does not interrupt a running model call or free its query slot early.
 
 **`/autosteer`** hands the policy a goal and asks it for the next subtask every `--autosteer_interval_s` seconds (default 10), applying each one through the same path as `/subtask` and announcing it in the chat. Every query is a full text generation, so the interval is a cost knob: lower values re-plan sooner but spend more of the loop generating text instead of acting. Plan progress lives in the policy, not the rollout, so the plan dies with the segment; the sequencer also stops on `/reset`, `/subtask`, `/autosteer off`, and the first planning failure.
+
+You can select `/autosteer <goal>` while idle, or launch with
+`--interactive=true --autosteer_goal="<goal>"`. On `/start`, the runtime first
+captures observations and generates a subtask while holding the robot. The action
+loop starts only after a subtask for the current goal is accepted; an empty or
+failed answer leaves the session idle. A late reply from a cancelled or replaced
+goal cannot start motion. `--autosteer_startup_timeout_s` (default 120) bounds this
+startup phase; a timed-out synchronous model call is discarded when it returns.
+The selected goal is retained across `/reset` and segment end, so the next `/start`
+plans again from the new scene. `/subtask` and `/autosteer off` clear that selection.
 
 **Logs below ERROR are muted while the session runs** so routine output doesn't interleave with what you're typing; errors and fatal inference failures still show, and normal logging resumes when the session ends. The [cadence summaries](#cadence-reporting) are printed in the chat instead, and running without `--interactive` gets you the live log back.
 

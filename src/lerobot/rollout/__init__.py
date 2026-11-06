@@ -34,6 +34,7 @@ from .configs import (
     RolloutConfig,
     RolloutStrategyConfig,
     SentryStrategyConfig,
+    TeleopTakeoverConfig,
 )
 from .context import (
     DatasetContext,
@@ -88,6 +89,7 @@ __all__ = [
     "RuntimeContext",
     "SentryStrategy",
     "SentryStrategyConfig",
+    "TeleopTakeoverConfig",
     "build_rollout_context",
     "create_strategy",
 ]

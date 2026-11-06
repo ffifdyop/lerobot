@@ -271,6 +271,36 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
 
 
 @dataclass
+class TeleopTakeoverConfig:
+    """Opt-in leader following and manual control for interactive base rollout."""
+
+    enabled: bool = False
+    # Native position units: degrees or normalized body units; gripper is 0–100.
+    max_position_error: float = 5.0
+    alignment_duration_s: float = 1.0
+    alignment_timeout_s: float = 5.0
+
+    def __post_init__(self) -> None:
+        for name in ("max_position_error", "alignment_duration_s", "alignment_timeout_s"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"takeover.{name} must be finite and > 0")
+        if self.alignment_timeout_s <= self.alignment_duration_s:
+            raise ValueError("takeover.alignment_timeout_s must exceed alignment_duration_s")
+
+
+def _validate_takeover_units(robot: object, teleop: object) -> None:
+    """Homogeneous SO arms must expose positions in the same units on both sides."""
+    if getattr(robot, "use_degrees", None) != getattr(teleop, "use_degrees", None):
+        raise ValueError("Teleop takeover requires matching leader/follower use_degrees")
+    for name in ("left_arm_config", "right_arm_config"):
+        follower = getattr(robot, name, None)
+        leader = getattr(teleop, name, None)
+        if follower is not None or leader is not None:
+            _validate_takeover_units(follower, leader)
+
+
+@dataclass
 class RolloutConfig:
     """Top-level configuration for the ``lerobot-rollout`` CLI.
 
@@ -309,10 +339,14 @@ class RolloutConfig:
     # robot does not move until /start, and logs below ERROR are muted for the
     # session's duration.
     interactive: bool = False
+    takeover: TeleopTakeoverConfig = field(default_factory=TeleopTakeoverConfig)
     # /autosteer: seconds of robot motion between two "what is the next subtask?"
     # queries, measured from the moment a subtask is applied.  Lower values
     # re-plan sooner but spend more of the loop generating text instead of acting.
     autosteer_interval_s: float = 10.0
+    # Interactive startup goal: generate its first subtask before entering the action loop.
+    autosteer_goal: str | None = None
+    autosteer_startup_timeout_s: float = 120.0
     # Robot commands sent per policy action.  Values > 1 linearly interpolate
     # between consecutive policy actions for smoother motion: commands go to
     # the robot at ``fps × multiplier`` Hz while policy inference and dataset
@@ -361,6 +395,16 @@ class RolloutConfig:
         # Read off the strategy's declarations, never its concrete type, so a
         # third-party strategy is validated exactly like a built-in one.
         strategy = self.strategy
+        if self.takeover.enabled:
+            if not self.interactive or strategy.type != "base" or self.inference.type not in {"rtc", "sync"}:
+                raise ValueError(
+                    "Teleop takeover requires interactive base rollout with local rtc or sync inference"
+                )
+            if self.teleop is None or self.robot is None:
+                raise ValueError("Teleop takeover requires --teleop.type and --robot.type")
+            if not math.isfinite(self.fps) or self.fps <= 0:
+                raise ValueError("Teleop takeover requires finite fps > 0")
+            _validate_takeover_units(self.robot, self.teleop)
         if strategy.requires_teleop and self.teleop is None:
             raise ValueError(f"{strategy.type} strategy requires --teleop.type to be set")
         if strategy.dataset_mode == "required" and self.dataset is None:
@@ -389,6 +433,10 @@ class RolloutConfig:
 
         if self.autosteer_interval_s < 0:
             raise ValueError(f"--autosteer_interval_s must be >= 0 (got {self.autosteer_interval_s}).")
+        if self.autosteer_goal is not None and (not self.interactive or not self.autosteer_goal.strip()):
+            raise ValueError("--autosteer_goal requires --interactive=true and a non-empty goal")
+        if not math.isfinite(self.autosteer_startup_timeout_s) or self.autosteer_startup_timeout_s <= 0:
+            raise ValueError("--autosteer_startup_timeout_s must be finite and > 0")
 
         # A strategy that writes frames from inside the timed control loop cannot afford
         # a blocking encode: force streaming encoding on its behalf.

@@ -182,6 +182,7 @@ class InferenceEngine(abc.ABC):
         self._autosteer_interval_s: float = 0.0
         self._autosteer_due_at: float = 0.0
         self._autosteer_generation = 0
+        self._autosteer_applied_generation: int | None = None
         self._autosteer_waiting_for_motion = False
 
         # External text backend: an off-policy planner answering on its own worker thread.
@@ -351,6 +352,15 @@ class InferenceEngine(abc.ABC):
             self._planner_hold = external
             self._planner_resume_due = False
         logger.info("Autosteer started for goal '%s' (every %.1fs)", goal, interval_s)
+
+    @property
+    def autosteer_has_subtask(self) -> bool:
+        """Whether the current goal has an accepted subtask, including same-text replies."""
+        with self._query_lock:
+            return (
+                self._autosteer_goal is not None
+                and self._autosteer_applied_generation == self._autosteer_generation
+            )
 
     def stop_autosteer(self) -> str | None:
         """Stop the sequencer, returning the goal it was driving (or ``None``).
@@ -607,6 +617,7 @@ class InferenceEngine(abc.ABC):
             live = self._autosteer_turn_is_current(query)
             if live:
                 self.set_task(subtask)
+                self._autosteer_applied_generation = self._autosteer_generation
                 # Armed only now, so the interval measures motion between subtasks.
                 self._autosteer_due_at = time.perf_counter() + self._autosteer_interval_s
                 # Even interval=0 must let a fresh action reach the robot before
@@ -730,6 +741,7 @@ class InferenceEngine(abc.ABC):
                 logger.info("Autosteer stopped (goal was '%s') — the planner reports it complete", query.text)
             else:
                 changed = self.set_task(subtask)
+                self._autosteer_applied_generation = self._autosteer_generation
                 # Armed only now, so the interval measures motion between subtasks; a fresh
                 # action must also reach the robot before another turn.
                 self._autosteer_due_at = time.perf_counter() + self._autosteer_interval_s

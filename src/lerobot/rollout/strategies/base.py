@@ -67,13 +67,23 @@ class BaseStrategy(RolloutStrategy):
 
                 with timer.section("observe"):
                     obs = robot.get_observation()
+                if ctx.hardware.leader_follower is not None:
+                    with timer.section("leader"):
+                        ctx.hardware.leader_follower.sync(obs)
                 with timer.section("process_obs"):
                     obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
                 if self._handle_warmup(cfg.use_torch_compile, timer):
                     continue
 
-                step = send_next_action(obs_processed, obs, ctx, interpolator, timer)
+                step = send_next_action(
+                    obs_processed,
+                    obs,
+                    ctx,
+                    interpolator,
+                    timer,
+                    cancelled=ctx.runtime.shutdown_event.is_set if ctx.hardware.leader_follower else None,
+                )
                 with timer.section("telemetry"):
                     self._log_telemetry(obs_processed, step, ctx.runtime)
 
@@ -89,8 +99,10 @@ class BaseStrategy(RolloutStrategy):
 
     def teardown(self, ctx: RolloutContext) -> None:
         """Disconnect hardware and stop inference."""
+        leader = ctx.hardware.leader_follower
         self._teardown_hardware(
             ctx.hardware,
-            return_to_initial_position=ctx.runtime.cfg.return_to_initial_position,
+            return_to_initial_position=ctx.runtime.cfg.return_to_initial_position
+            and not (leader is not None and leader.failed),
         )
         logger.info("Base strategy teardown complete")

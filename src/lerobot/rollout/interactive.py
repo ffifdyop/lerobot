@@ -131,11 +131,18 @@ class InteractiveSession:
         self.controller = RolloutController(strategy, ctx, on_event=self._on_event)
         self._runtime = ctx.runtime
         self._play_sounds = ctx.runtime.cfg.play_sounds
-        self._listener = StdinCommandListener(self._handle_line, on_eof=self._handle_eof, stream=input_stream)
+        self._listener = StdinCommandListener(
+            self._handle_line,
+            on_eof=self._handle_eof,
+            stream=input_stream,
+            on_space=self._handle_space if self.controller.takeover_enabled else None,
+        )
 
         # name -> (handler, argument hint, help line); /help and the banner render from this table.
         self._commands: dict[str, tuple[Callable[[InteractiveCommand], None], str, str]] = {
             "start": (self._cmd_start, "", "start (or restart) the policy control loop"),
+            "teleop": (self._cmd_teleop, "", "align the leader and hand control to the human"),
+            "resume": (self._cmd_resume, "", "end teleoperation and resume policy with fresh planning"),
             "subtask": (self._cmd_subtask, " <text>", "set the instruction the policy follows"),
             "vqa": (self._cmd_vqa, " <text>", "ask the policy a question about what it sees"),
             "autosteer": (
@@ -166,8 +173,15 @@ class InteractiveSession:
         try:
             with _mute_system_output(), self._route_cadence_reports():
                 self._print(self._render_banner())
-                self._listener.start()
                 try:
+                    self._listener.start()
+                    if self.controller.takeover_enabled:
+                        self._print(
+                            "Space hotkey active — tap Space on an empty command line to take over/resume. "
+                            "No Enter needed; keep this terminal focused."
+                            if self._listener.space_hotkey_enabled
+                            else "Space hotkey unavailable for this input — use /teleop and /resume commands."
+                        )
                     self.controller.serve()
                 finally:
                     self._listener.stop()
@@ -182,12 +196,31 @@ class InteractiveSession:
     def _on_event(self, event: RolloutEvent, payload: QueryAnswer | None = None) -> None:
         if event is RolloutEvent.QUERY_ANSWERED and payload is not None:
             self._report_answer(payload)
+        elif event is RolloutEvent.ALIGNMENT_STARTED:
+            self._print("Aligning leader to follower — follower held; wait for control-ready message.")
+        elif event is RolloutEvent.ALIGNMENT_FAILED:
+            self._print(
+                "Leader alignment timed out — follower held. Check alignment, then /teleop or /start to retry."
+            )
+        elif event is RolloutEvent.TELEOP_STARTED:
+            self._print(
+                "Human control active — leader torque released. Tap Space or /resume to replan and return to policy."
+            )
+        elif event is RolloutEvent.TELEOP_ENDED:
+            self._print("Human control ended — follower held.")
+        elif event is RolloutEvent.PLANNING_STARTED:
+            self._print(
+                f"Planning first subtask — goal {self.controller.autosteer_goal!r}. "
+                "Robot is holding position until a subtask is accepted."
+            )
         elif event is RolloutEvent.SEGMENT_STARTED:
             log_say("Starting rollout", self._play_sounds)
             self._print(
                 f"Rollout running — task {_format_task(self.controller.task)}. "
                 "/subtask <text> to change it, /reset to return to initial position, /stop to shut down."
             )
+            if self.controller.takeover_enabled:
+                self._print("Leader following is active. Tap Space or /teleop to request human control.")
         elif event is RolloutEvent.SEGMENT_ENDED:
             self._print(
                 "Rollout run ended. Robot is holding position — "
@@ -271,10 +304,35 @@ class InteractiveSession:
         if self.controller.start():
             return
         # start() also refuses while stopping or after a failure — don't mislabel an idle robot.
-        if self.controller.running:
+        if self.controller.teleoperating:
+            self._print("Human control active — use /resume to return to policy.")
+        elif self.controller.running:
             self._print("Already running — /reset to pause first, or /stop to shut down.")
         else:
             self._print("Can't start — the session is stopping or has failed.")
+
+    def _cmd_teleop(self, cmd: InteractiveCommand) -> None:
+        if not self.controller.takeover_enabled:
+            self._print("Teleop takeover is disabled — launch with --takeover.enabled=true and --teleop.*.")
+        elif self.controller.teleop():
+            self._print("Takeover requested — wait for 'Human control active' before moving the leader.")
+        else:
+            self._print("Can't take over — already requested/active, resetting, stopping, or failed.")
+
+    def _handle_space(self) -> None:
+        action = self.controller.toggle_teleop()
+        if action == "teleop":
+            self._print("Takeover requested — wait for 'Human control active' before moving the leader.")
+        elif action == "resume":
+            self._print("Policy resume requested — release the leader for alignment and fresh planning.")
+
+    def _cmd_resume(self, cmd: InteractiveCommand) -> None:
+        if self.controller.resume():
+            self._print("Policy resume requested — release the leader for alignment and fresh planning.")
+        else:
+            self._print(
+                "Can't resume — human control is not active, or the session is resetting/stopping/failed."
+            )
 
     def _cmd_subtask(self, cmd: InteractiveCommand) -> None:
         # Strip quotes before the emptiness check, so /subtask "" reports the task instead of
@@ -353,14 +411,20 @@ class InteractiveSession:
         if result is AskResult.UNSUPPORTED:
             self._print(f"Autosteering is unavailable for this setup. {self._text_support_hint()}")
         elif result is AskResult.NOT_RUNNING:
-            self._print("Not running — /start first so the policy has a live view to plan from.")
+            self._print("Cannot arm autosteer — the session is stopping or has failed.")
         elif result is AskResult.INVALID:
             self._print(f"Autosteer goal rejected — {self.controller.text_input_error(goal)}")
         elif result is AskResult.QUEUED:
-            self._print(
-                f"Autosteer on — goal {goal!r}. The policy picks its own subtasks; "
-                "each one is announced here. Take over with /subtask <text> or /autosteer off."
-            )
+            if self.controller.running:
+                self._print(
+                    f"Autosteer on — goal {goal!r}. The policy picks its own subtasks; "
+                    "each one is announced here. Take over with /subtask <text> or /autosteer off."
+                )
+            else:
+                self._print(
+                    f"Autosteer armed — goal {goal!r}. /start will generate the first subtask "
+                    "before executing policy actions."
+                )
         else:  # a future AskResult variant must not be announced as success
             logger.error("Unhandled AskResult %r for /autosteer", result)
             self._print(f"Could not start autosteer ({result.value}).")
@@ -385,13 +449,24 @@ class InteractiveSession:
         usages = {name: f"/{name}{entry[1]}" for name, entry in self._commands.items()}
         width = max(len(usage) for usage in usages.values())
         lines = [f"  {usages[name]:<{width}}   {entry[2]}" for name, entry in self._commands.items()]
-        return "Available commands:\n" + "\n".join(lines)
+        help_text = "Available commands:\n" + "\n".join(lines)
+        if self.controller.takeover_enabled:
+            help_text += (
+                "\n  Space (TTY, empty input line): toggle human control / policy; no Enter needed."
+                "\n  Tap briefly; leave at least 0.75 s between Space taps. Ctrl-U clears unfinished input."
+            )
+        return help_text
 
     def _render_banner(self) -> str:
+        instruction = (
+            f"Goal: {self.controller.autosteer_goal!r}\n/start will plan the first subtask before motion.\n"
+            if self.controller.autosteer_goal is not None
+            else f"Task: {_format_task(self.controller.initial_task)}\n"
+        )
         return (
             f"{_BANNER_RULE}\n"
             "Interactive rollout session — the robot will NOT move until you type /start.\n"
-            f"Task: {_format_task(self.controller.initial_task)}\n"
+            f"{instruction}"
             f"{self._render_help()}\n"
             "Routine system logs and warnings are muted during the session (errors and the "
             "cadence summary of each run still show).\n"

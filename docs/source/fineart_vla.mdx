@@ -224,11 +224,47 @@ reduces generation cost but also slows replanning.
 Use `lerobot-rollout` with the robot/camera configuration matching the checkpoint,
 `--interactive=true`, and `--autosteer_interval_s=3`. Choose
 `--inference.type=sync` or `--inference.type=rtc`. In the interactive terminal,
-`/autosteer <goal>` enables generated subtasks, `/subtask <instruction>` supplies
-one manually, and `/start` starts robot control. See [Interactive language
+set `/autosteer <goal>` while idle, then `/start`. The runtime captures a fresh
+observation and waits for the first generated subtask before entering the action
+loop. No manual initial subtask is needed. You can also preselect the goal with
+`--autosteer_goal="<goal>"`; the session still waits for `/start`.
+`/subtask <instruction>` switches to manual low-level conditioning. See [Interactive language
 control](./inference#interactive-language-control) for complete hardware setup,
 safety behavior, and recording controls. The former `--sim`, `--mode`, and
 `--high_level_hz` adapter CLI options are not part of this interface.
+
+### Bimanual SO-101 human takeover
+
+The repository's `rollout.sh` enables leader following and manual intervention by default
+while retaining automatic subtask generation. Its local hardware defaults match
+`~/Dev/Manipulation/lerobot/teleoperate.sh`: follower ID `bimanual_follower`, leader ID
+`bimanual_leader`, and `use_degrees=false` on all four arms. The leaders use stable serial
+paths `/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B3E089335-if00` (left) and
+`/dev/serial/by-id/usb-1a86_USB_Single_Serial_5B3D044325-if00` (right).
+
+```bash
+bash rollout.sh check
+bash rollout.sh
+```
+
+Override `ROBOT_ID`, `LEADER_ID`, `LEFT_FOLLOWER_PORT`, `RIGHT_FOLLOWER_PORT`,
+`LEFT_LEADER_PORT`, or `RIGHT_LEADER_PORT` through environment variables for other hardware.
+The existing calibration lookup uses `<ID>_left.json` and `<ID>_right.json` under
+`robots/so_follower` and `teleoperators/so_leader` in the LeRobot calibration directory;
+the script does not copy or regenerate calibration files. Use `TELEOP_TAKEOVER=0`
+to disable takeover. The library configuration still defaults to takeover disabled.
+
+`check` only parses checkpoint/configuration files; it does not load weights, connect
+hardware, or validate calibration. `/start` aligns the leaders, generates the initial
+subtask, then starts policy control with continuous measured-pose following. With the
+rollout terminal focused and the input line empty, tap **Space** to request human
+control (no Enter needed); wait for `Human control active` before dragging the leaders.
+Tap **Space again** to realign them and replan from the current scene under the same
+overall goal. Use short taps at least 0.75 seconds apart. Spaces in typed commands remain
+ordinary text; Ctrl-U clears unfinished input. `/teleop` and `/resume` also remain available.
+This mode does not record intervention data. See [Human takeover with continuous leader
+following](./inference#human-takeover-with-continuous-leader-following) for alignment
+settings, cancellation behavior, and hardware validation limits.
 
 ## Troubleshooting
 
