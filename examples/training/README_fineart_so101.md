@@ -239,7 +239,8 @@ GPU_IDS=0,2 WANDB_PROJECT=fineart-so101 bash scripts/train_fineart_so101.sh trai
 
 smoke 会真实加载权重、拟合 FAST、计算 loss、反向传播并保存最终 checkpoint。
 正式运行从原始 midtrained checkpoint 开始，smoke 用来验证训练链路。
-两种模式默认生成独立的时间戳目录，旧训练目录存在时拒绝覆盖。
+两种模式默认生成精确到秒的 UTC 时间戳目录，例如 `train_20261105T054916Z`，
+旧训练目录存在时拒绝覆盖。
 
 自定义示例：
 

@@ -147,7 +147,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if min(args.warmup_steps, args.save_freq, args.eval_freq, args.max_eval_samples) < 0 or args.log_freq < 1:
         parser.error("warmup/save/eval/sample limits must be nonnegative; log-freq must be positive")
     args.dataset_root = args.dataset_root.expanduser().resolve()
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     args.run_dir = args.run_dir or REPO_ROOT / "outputs" / "fineart_so101" / f"{args.mode}_{stamp}"
     args.run_dir = args.run_dir.expanduser().resolve()
     return args
